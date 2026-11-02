@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v1.2.5 Patch #1"
+#define CDB_VERSION "v.1.2.5 Patch #2"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -98,7 +98,7 @@ static struct {
     Method<void> recSetSource, recSetClip, recSetLoop, recSetTransmit, recSetVad, recRestart0, recRestart1,
                  recSetRecording, recSetOnlyWhenEnabled, recStart;
     Method<int> recGetSource;
-    Method<bool> recGetTransmit, recGetVad, recGetRecording, recGetSending;
+    Method<bool> recGetTransmit, recGetVad, recGetRecording, recGetSending, recGetInit;
     Field<int> recFieldSource;                         // the backing fields, set too (some versions read these)
     Field<Il2CppObject *> recFieldClip;
     Field<bool> recFieldLoop;
@@ -184,6 +184,7 @@ static bool Lookups() {
             G.recSetRecording = rec.GetMethod("set_IsRecording", 1);
             G.recGetRecording = rec.GetMethod("get_IsRecording", 0);
             G.recGetSending = rec.GetMethod("get_IsCurrentlyTransmitting", 0);   // true only while audio really goes out
+            G.recGetInit = rec.GetMethod("get_IsInitialized", 0);               // true when it's hooked up to the voice connection
             G.recSetOnlyWhenEnabled = rec.GetMethod("set_RecordOnlyWhenEnabled", 1);
             G.recStart = rec.GetMethod("StartRecording", 0);
             G.recFieldSource = rec.GetField("sourceType");
@@ -1963,27 +1964,53 @@ static double g_micUntil = 0, g_clipLen = 0;      // when the song ends; the son
 static double g_micCheckAt = 0;                  // when to check the room is getting it
 static int g_micTries = 0;
 
+// Which recorder sends your voice to the room. A game can have more than one Recorder and
+// only the one hooked up to the voice connection (IsInitialized) really sends anything, so
+// that one wins; then an enabled one; then any.
+static int RecorderScore(Il2CppObject *r) {
+    if (!Alive(r)) return -1;
+    int s = 0;
+    if (G.recGetInit.IsValid() && G.recGetInit[r]()) s += 4;
+    if (!G.behaviourGetEnabled.IsValid() || G.behaviourGetEnabled[r]()) s += 2;
+    if (G.recGetTransmit.IsValid() && G.recGetTransmit[r]()) s += 1;
+    return s;
+}
+static void LogRecorder(const char *what, Il2CppObject *r) {
+    if (!Alive(r)) { ym::log("clientdabell: %s: none", what); return; }
+    ym::log("clientdabell: %s: initialized=%d enabled=%d transmit=%d recording=%d sending=%d source=%d", what,
+            G.recGetInit.IsValid() ? (int)G.recGetInit[r]() : -1,
+            G.behaviourGetEnabled.IsValid() ? (int)G.behaviourGetEnabled[r]() : -1,
+            G.recGetTransmit.IsValid() ? (int)G.recGetTransmit[r]() : -1,
+            G.recGetRecording.IsValid() ? (int)G.recGetRecording[r]() : -1,
+            G.recGetSending.IsValid() ? (int)G.recGetSending[r]() : -1,
+            G.recGetSource.IsValid() ? G.recGetSource[r]() : -1);
+}
 static Il2CppObject *FindRecorder() {
     Il2CppObject *r = g_recorder.get();
     if (Alive(r)) return r;
     g_recorder.clear();
     r = nullptr;
     if (!G.tRecorder) return nullptr;
+    int best = -1;
     if (G.goFind.IsValid()) {                       // the voice object most Photon VR games use
         Il2CppObject *go = G.goFind(CreateMonoString("PhotonVRVoice"));
-        if (Alive(go)) r = G.goGetComponent[go]((Il2CppObject *)G.tRecorder);
+        if (Alive(go)) { r = G.goGetComponent[go]((Il2CppObject *)G.tRecorder); best = RecorderScore(r); }
     }
-    if (!Alive(r) && (G.findScene.IsValid() || G.findSceneByType.IsValid())) {   // else any Recorder, an enabled one first
+    if (best < 6 && (G.findScene.IsValid() || G.findSceneByType.IsValid())) {   // not clearly the live one: look at all of them
         auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tRecorder)
                                                       : G.findSceneByType((Il2CppObject *)G.tRecorder, 0));
         uintptr_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
         auto **el = arr ? (Il2CppObject **)(arr + 0x20) : nullptr;
-        for (uintptr_t i = 0; i < n && !Alive(r); i++)
-            if (Alive(el[i]) && (!G.behaviourGetEnabled.IsValid() || G.behaviourGetEnabled[el[i]]())) r = el[i];
-        for (uintptr_t i = 0; i < n && !Alive(r); i++) if (Alive(el[i])) r = el[i];
-        ym::log("clientdabell: %d voice recorders in the scene", (int)n);
+        for (uintptr_t i = 0; i < n && i < 32; i++) {
+            int sc = RecorderScore(el[i]);
+            if (sc > best) { best = sc; r = el[i]; }
+            char what[48];
+            snprintf(what, sizeof what, "voice recorder %d of %d", (int)i + 1, (int)n);
+            LogRecorder(what, el[i]);
+        }
     }
     if (!Alive(r)) return nullptr;
+    LogRecorder("using voice recorder", r);
     g_recorder.set(r);
     return r;
 }
@@ -2116,6 +2143,7 @@ static void SoundTick() {
     }
     if (g_micTries >= 5 && MicSettingsOk(r)) {         // set up right, but no sign of sound going out: keep it, say so
         ym::log("clientdabell: voice set to the song but not confirmed sending");
+        LogRecorder("recorder after the song was sent", r);
         Notify("Sent to voice chat, couldn't confirm the room hears it");
         g_micCheckAt = 0;
         return;
