@@ -2703,6 +2703,7 @@ static void DisableSongsReset() {                       // everyone back to norm
     g_nextSpkFind = g_nextSpkMeasure = 0;
 }
 static void DisableSongsToggled() {
+    g_nextSpkReport = g_time + 2.5;                     // first report right after the [ON] message
     if (!f_disableSongs) { DisableSongsReset(); Notify("Disable Songs off"); }
     else Notify(G.tSpeaker && G.asGetOutputData.IsValid() ? "Disable Songs on" : "Disable Songs isn't available in this game");
 }
@@ -2744,7 +2745,15 @@ static void FindSpeakers() {
 }
 static void DisableSongsTick() {
     if (!f_disableSongs && g_spkN > 0) DisableSongsReset();   // switched off some other way (Turn Everything Off): unmute everyone
-    if (!f_disableSongs || !G.tSpeaker || !G.asGetOutputData.IsValid() || !G.asSetVolume.IsValid() || !G.arrayNew || !G.floatClass) return;
+    if (!f_disableSongs) return;
+    if (!G.tSpeaker || !G.asGetOutputData.IsValid() || !G.asSetVolume.IsValid() || !G.arrayNew || !G.floatClass) {
+        if (g_time >= g_nextSpkReport) {                 // say what's missing (for fixing it)
+            g_nextSpkReport = g_time + 3.0;
+            Notify("Songs: missing speaker=%d data=%d vol=%d buf=%d", G.tSpeaker ? 1 : 0, G.asGetOutputData.IsValid() ? 1 : 0,
+                   G.asSetVolume.IsValid() ? 1 : 0, G.arrayNew && G.floatClass ? 1 : 0);
+        }
+        return;
+    }
     if (g_time >= g_nextSpkFind) { g_nextSpkFind = g_time + 2.0; FindSpeakers(); }
     if (g_time >= g_nextSpkReport) {                     // on-screen check (for fixing it): what it sees
         g_nextSpkReport = g_time + 3.0;
