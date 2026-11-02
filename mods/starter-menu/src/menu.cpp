@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v.1.2.7 Patch #1"
+#define CDB_VERSION "v.1.2.8"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -528,8 +528,8 @@ static void OverpoweredOff();
 static void NextWeatherIntensity();
 static void TodPicked();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, SPAWNER, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers", "Item Spawner"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -594,6 +594,7 @@ static Item g_items[] = {
     {RIG, "Beyblade", TOGGLE, MAIN, &g_danceSel[7], DancePicked},
 
     {ITEMS, "Exit Items", OPEN, MAIN},
+    {ITEMS, "Item Spawner", OPEN, SPAWNER},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
@@ -667,6 +668,12 @@ static Item g_items[] = {
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
 static void DisableAllMods();
+// Item Spawner: a list built from the game's own items (every item kind it has loaded).
+static std::vector<std::string> g_catalog;              // item kinds (their keys), sorted
+static std::vector<Item> g_spawnView;                    // one button per kind (labels point into g_catalog)
+static void SpawnPicked();
+static Item g_spawnExit = {SPAWNER, "Exit Item Spawner", OPEN, ITEMS};
+static Item *g_lastPressed = nullptr;                   // the button being pressed right now (for SpawnPicked)
 static bool f_modsPaused = false;               // Enabled Mods -> Disable All Mods is on: the mods that were on are saved here
 static std::vector<Item *> g_pausedMods;
 static Item g_disableAllItem = {ENABLED, "Disable All Mods", TOGGLE, MAIN, &f_modsPaused, DisableAllMods};
@@ -713,6 +720,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
     {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
+    {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
@@ -869,7 +877,10 @@ static void DisableAllMods() {
 
 static void BuildView() {
     g_view.clear();
-    if (g_cat == ENABLED) {
+    if (g_cat == SPAWNER) {
+        g_view.push_back(&g_spawnExit);
+        for (auto &it : g_spawnView) g_view.push_back(&it);
+    } else if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
         bool any = f_modsPaused;                          // the switch stays while mods are saved
         for (auto &it : g_items) any |= ListedAsMod(it);
@@ -1233,7 +1244,9 @@ static void RebuildMenuNow() {
     SetLayout(f_barkMode);
 }
 
+static void ScanCatalog();
 static void Press(Item *it) {
+    g_lastPressed = it;
     switch (it->kind) {
     // A button's own code is run inside a safety net: if it fails, that switch goes back off and
     // you get a message, instead of the error stopping the whole menu.
@@ -1241,6 +1254,7 @@ static void Press(Item *it) {
         g_cat = it->target;
         g_page = 0;
         if (it->target == SOUNDBOARD) { try { ScanSongs(); } catch (...) { ym::log("clientdabell: song scan error"); } }
+        if (it->target == SPAWNER) { try { ScanCatalog(); } catch (...) { ym::log("clientdabell: item list error"); } }
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
@@ -2207,6 +2221,46 @@ static void ItemOrbitTick(float dt) {
 
 // Spawn On Hand: each right-trigger press (grip open) spawns the item at your hand.
 static bool g_onHandTrigger = false;
+// Item Spawner: every Item the game has loaded (Resources.FindObjectsOfTypeAll also finds the
+// item prefabs that aren't in the room), one entry per item kind. Built when the page opens.
+static void ScanCatalog() {
+    if (!G.tItem || !G.itemKey.IsValid() || !G.findAll.IsValid()) { Notify("Item list isn't available in this game"); return; }
+    std::vector<std::string> keys;
+    auto *arr = (uint8_t *)G.findAll((Il2CppObject *)G.tItem);
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(it)) continue;
+        auto *k = G.itemKey[it]();
+        std::string key = k ? k->str() : "";
+        if (!key.empty() && key.size() < 60) keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    if (keys.size() > 400) keys.resize(400);
+    g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
+    g_catalog = std::move(keys);
+    g_spawnView.reserve(g_catalog.size());
+    for (auto &k : g_catalog) g_spawnView.push_back({SPAWNER, k.c_str(), ACTION, MAIN, nullptr, SpawnPicked});
+    g_page = 0;
+    ym::log("clientdabell: item spawner found %d item kinds", (int)g_catalog.size());
+    Notify(g_catalog.empty() ? "No items found" : "%d items", (int)g_catalog.size());
+}
+// Tapping an item in the list: one of it appears 80 cm in front of you. Same limits as
+// Spawn On Hand: one every 0.3 s, through the item queue (2 sent per frame, 32 waiting at most).
+static void SpawnPicked() {
+    Item *it = g_lastPressed;
+    Il2CppObject *head = g_head.get();
+    if (!it || !head || g_spawnView.empty() || it < &g_spawnView[0] || it > &g_spawnView.back()) return;
+    if (g_time < g_nextItem) return;
+    if (g_itemQueue.size() >= 32) { Notify("Wait a moment"); return; }
+    g_nextItem = g_time + 0.3;
+    snprintf(g_itemKey, sizeof g_itemKey, "%s", g_catalog[it - &g_spawnView[0]].c_str());
+    Vector3 f = G.trGetForward[head]();
+    g_itemQueue.push_back({G.trGetPosition[head]() + f * 0.8f + Vector3(0, -0.2f, 0), Vector3(0, 0, 0)});
+    Notify("Spawned %.40s", g_itemKey);
+}
+
 static void SpawnOnHandTick(const Buttons &in) {
     bool press = in.rtrig && !g_onHandTrigger;
     g_onHandTrigger = in.rtrig;
