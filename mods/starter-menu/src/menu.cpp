@@ -2240,7 +2240,7 @@ static bool g_onHandTrigger = false;
 // item prefabs that aren't in the room), one entry per item kind. Built when the page opens.
 static std::vector<std::string> g_seenKeys;               // every item kind seen this session (grows as you play)
 static void SeeKey(const std::string &key) {
-    if (key.empty() || key.size() >= 60 || g_seenKeys.size() >= 1000) return;
+    if (key.empty() || key.size() >= 60 || g_seenKeys.size() >= 3000) return;
     for (auto &k : g_seenKeys) if (k == key) return;
     g_seenKeys.push_back(key);
 }
@@ -2550,6 +2550,11 @@ static int ReadNetLists() {
 // confirmed real (like one you held or spawned).
 static int g_classListsUsed = 0;
 static std::string g_listFrom;
+static std::vector<std::string> g_trustedFrom;            // parts whose list was confirmed real before (saved)
+static bool TrustedFrom(const char *nm) {
+    for (auto &t : g_trustedFrom) if (t == nm) return true;
+    return false;
+}
 static int ReadLoadedLists() {
     Refl &r = Reflection();
     auto Rs = ym::api()->resolve;
@@ -2569,7 +2574,7 @@ static int ReadLoadedLists() {
         !G.findAll.IsValid())
         return 0;
     std::vector<std::string> confirmed = g_seenKeys;
-    if (confirmed.empty()) return 0;
+    if (confirmed.empty() && g_trustedFrom.empty()) return 0;
     std::sort(confirmed.begin(), confirmed.end());
     void *uobjClass = uobj.GetClass();
     auto FieldOff = [&](Il2CppObject *o, std::initializer_list<const char *> names) {
@@ -2656,9 +2661,10 @@ static int ReadLoadedLists() {
                 std::vector<std::string> names;
                 try { Read(*(Il2CppObject **)((uint8_t *)o + fk.first), fk.second, names); } catch (...) { continue; }
                 if (names.size() < 2) continue;
-                bool trusted = false;
-                for (auto &s2 : names) if (std::binary_search(confirmed.begin(), confirmed.end(), s2)) { trusted = true; break; }
+                bool trusted = TrustedFrom(nm);
+                for (auto &s2 : names) if (!trusted && std::binary_search(confirmed.begin(), confirmed.end(), s2)) trusted = true;
                 if (!trusted) continue;
+                if (!TrustedFrom(nm)) g_trustedFrom.push_back(nm);
                 ym::log("clientdabell: item spawner: %s list has %d names, used", nm, (int)names.size());
                 g_classListsUsed++;
                 if (g_listFrom.empty()) g_listFrom = nm;
@@ -2667,6 +2673,48 @@ static int ReadLoadedLists() {
         }
     }
     return added;
+}
+
+// The item list is saved to clientdabell_items.txt next to the mod files, so once it has loaded
+// one time it's there every time after (even right after starting the game, or on a map where
+// the game's list isn't loaded). "#from Name" lines remember which game parts had the real list.
+static std::string ItemsPath() {
+    const char *base = ym::api()->modsDir;
+    return std::string(base ? base : ".") + "/clientdabell_items.txt";
+}
+static size_t g_itemsSaved = 0;
+static void LoadItemCache() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    FILE *f = fopen(ItemsPath().c_str(), "r");
+    if (!f) return;
+    char line[128];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+        if (!len) continue;
+        if (!strncmp(line, "#from ", 6)) { if (!TrustedFrom(line + 6)) g_trustedFrom.push_back(line + 6); continue; }
+        if (line[0] == '#') continue;
+        SeeKey(line);
+        n++;
+    }
+    fclose(f);
+    g_itemsSaved = g_seenKeys.size();
+    ym::log("clientdabell: item spawner: loaded %d saved items", n);
+}
+static void SaveItemCache() {
+    if (g_seenKeys.size() <= g_itemsSaved && g_trustedFrom.empty()) return;
+    if (g_seenKeys.size() < g_itemsSaved) return;          // never shrink the saved list
+    std::string text = "# ClientDaBell item list\n";
+    for (auto &t : g_trustedFrom) text += "#from " + t + "\n";
+    for (auto &k : g_seenKeys) text += k + "\n";
+    FILE *f = fopen(ItemsPath().c_str(), "w");
+    if (!f) { ym::log("clientdabell: couldn't save items to %s", ItemsPath().c_str()); return; }
+    fputs(text.c_str(), f);
+    fclose(f);
+    g_itemsSaved = g_seenKeys.size();
 }
 
 static void ScanCatalog() {
@@ -2681,12 +2729,14 @@ static void ScanCatalog() {
                                                                  : G.findSceneByType((Il2CppObject *)G.tItem, 0)), errors);
         } catch (...) { errors++; }
     }
+    try { LoadItemCache(); } catch (...) { errors++; }   // everything found on earlier days
     if (g_itemKey[0]) SeeKey(g_itemKey);                 // the last item you held
     int defs = 0, fromNet = 0;
     try { FindItemDefinitions(); defs = ReadItemDefinitions(); } catch (...) { errors++; }
     try { fromNet = ReadNetLists(); } catch (...) { errors++; }
     int fromParts = 0;
     try { fromParts = ReadLoadedLists(); } catch (...) { errors++; }
+    try { SaveItemCache(); } catch (...) { errors++; }
     std::vector<std::string> keys = g_seenKeys;
     std::sort(keys.begin(), keys.end());
     g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
@@ -2699,7 +2749,7 @@ static void ScanCatalog() {
     ym::log("clientdabell: item spawner: %d new from %d game lists, %d new from %d part lists (%s)", fromNet, g_netListsUsed,
             fromParts, g_classListsUsed, g_listFrom.c_str());
     int lists = g_netListsUsed + g_classListsUsed;
-    if (g_seenKeys.empty() || (!g_defFound && lists == 0))
+    if (g_seenKeys.empty() || (!g_defFound && lists == 0 && g_trustedFrom.empty()))
         Notify("%d items (lists=0; hold or spawn an item, then reopen)", (int)g_catalog.size());
     else if (!g_listFrom.empty()) Notify("%d items (lists=%d, from %s)", (int)g_catalog.size(), lists, g_listFrom.c_str());
     else Notify("%d items (lists=%d)", (int)g_catalog.size(), lists);
