@@ -92,7 +92,8 @@ static struct {
     Method<bool> audioClipSetData, audioClipGetData;
     Method<int> audioClipSamples, asGetTimeSamples;
     Method<float> asGetVolume;
-    Method<void> asGetOutputData;                      // Disable Songs: how loud another player is
+    Method<void> asGetOutputData;                      // Disable Songs: how loud another player is (if the game has it)
+    Method<Il2CppObject *> asGetClip;                  // ...else read the clip Photon writes their voice into
     BNM::MonoType *tSpeaker = nullptr;                 // Photon Voice's Speaker: plays another player's voice
     Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
     Method<bool> asIsPlaying;
@@ -177,7 +178,14 @@ static bool Lookups() {
             G.asStop = asrc.GetMethod("Stop", 0);
             G.asGetTimeSamples = asrc.GetMethod("get_timeSamples", 0);     // where the song is now
             G.asGetVolume = asrc.GetMethod("get_volume", 0);
-            G.asGetOutputData = Overload(asrc, "GetOutputData", {"System.Single[]", "System.Int32"});
+            G.asGetClip = asrc.GetMethod("get_clip", 0);
+            for (auto &m : asrc.GetMethods(false)) {          // GetOutputData(float[], int): the array one, not (int, int)
+                auto *mi = m.GetInfo();
+                if (!mi || !mi->name || strcmp(mi->name, "GetOutputData") != 0 || mi->parameters_count != 2) continue;
+                std::string t0 = TypeName(mi->parameters[0]);
+                ym::log("clientdabell: AudioSource.GetOutputData(%s, %s)", t0.c_str(), TypeName(mi->parameters[1]).c_str());
+                if (t0 != "System.Int32") G.asGetOutputData = m;
+            }
             G.asIsPlaying = asrc.GetMethod("get_isPlaying", 0);
         }
         Class spk("Photon.Voice.Unity", "Speaker");
@@ -2746,10 +2754,11 @@ static void FindSpeakers() {
 static void DisableSongsTick() {
     if (!f_disableSongs && g_spkN > 0) DisableSongsReset();   // switched off some other way (Turn Everything Off): unmute everyone
     if (!f_disableSongs) return;
-    if (!G.tSpeaker || !G.asGetOutputData.IsValid() || !G.asSetVolume.IsValid() || !G.arrayNew || !G.floatClass) {
+    bool canClip = G.asGetClip.IsValid() && G.audioClipGetData.IsValid() && G.asGetTimeSamples.IsValid() && G.audioClipSamples.IsValid();
+    if (!G.tSpeaker || !(G.asGetOutputData.IsValid() || canClip) || !G.asSetVolume.IsValid() || !G.arrayNew || !G.floatClass) {
         if (g_time >= g_nextSpkReport) {                 // say what's missing (for fixing it)
             g_nextSpkReport = g_time + 3.0;
-            Notify("Songs: missing speaker=%d data=%d vol=%d buf=%d", G.tSpeaker ? 1 : 0, G.asGetOutputData.IsValid() ? 1 : 0,
+            Notify("Songs: missing speaker=%d data=%d clip=%d vol=%d buf=%d", G.tSpeaker ? 1 : 0, G.asGetOutputData.IsValid() ? 1 : 0, canClip ? 1 : 0,
                    G.asSetVolume.IsValid() ? 1 : 0, G.arrayNew && G.floatClass ? 1 : 0);
         }
         return;
@@ -2774,12 +2783,33 @@ static void DisableSongsTick() {
         SpeakerWatch &w = g_spk[k];
         Il2CppObject *src = w.src.get();
         if (!Alive(src)) continue;
-        G.asGetOutputData[src](buf, 0);
+        // How loud they are: the last 1024 samples of the clip Photon writes their voice into
+        // (before the volume, so muting doesn't change it), or else what the AudioSource plays.
+        bool fromClip = false;
+        if (G.asIsPlaying.IsValid() && !G.asIsPlaying[src]()) {   // their voice isn't playing at all: silent
+            w.quietRun += step;
+            if (w.quietRun >= kPauseSecs) w.loudRun = 0;
+            if (w.muted && w.quietRun >= kQuietSecs) { SpeakerUnmute(w); w.loudRun = 0; Notify("Song stopped, unmuted"); }
+            continue;
+        }
+        Il2CppObject *clip = canClip ? G.asGetClip[src]() : nullptr;
+        if (Alive(clip)) {
+            int len = G.audioClipSamples[clip]();
+            if (len > 2048) {
+                int pos = G.asGetTimeSamples[src]() - 1024;
+                if (pos < 0) pos += len;                 // GetData wraps past the end by itself
+                fromClip = G.audioClipGetData[clip](buf, pos);
+            }
+        }
+        if (!fromClip) {
+            if (!G.asGetOutputData.IsValid()) continue;
+            G.asGetOutputData[src](buf, 0);
+        }
         double sum = 0;
         for (int i = 0; i < 1024; i++) sum += d[i] * d[i];
         float rms = sqrtf((float)(sum / 1024));
-        // While muted the volume is turned down, so scale back up to how loud they really are
-        float level = w.muted ? rms / kMutedVol : rms;
+        // AudioSource output is after the volume: while muted, scale back up to how loud they really are
+        float level = (w.muted && !fromClip) ? rms / kMutedVol : rms;
         if (level > g_spkMaxLevel) g_spkMaxLevel = level;
         if (level > kLoud) { w.loudRun += step; w.quietRun = 0; }
         else {
