@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v1.2.5"
+#define CDB_VERSION "v1.2.5 Patch #1"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -91,13 +91,14 @@ static struct {
     Method<Il2CppObject *> audioClipCreate;           // soundboard
     Method<bool> audioClipSetData;
     Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
+    Method<bool> asIsPlaying;
     BNM::MonoType *tAudioSource = nullptr;
     // Soundboard through voice chat: Photon Voice's Recorder (the thing that sends your mic)
     BNM::MonoType *tRecorder = nullptr;
     Method<void> recSetSource, recSetClip, recSetLoop, recSetTransmit, recSetVad, recRestart0, recRestart1,
                  recSetRecording, recSetOnlyWhenEnabled, recStart;
     Method<int> recGetSource;
-    Method<bool> recGetTransmit, recGetVad, recGetRecording;
+    Method<bool> recGetTransmit, recGetVad, recGetRecording, recGetSending;
     Field<int> recFieldSource;                         // the backing fields, set too (some versions read these)
     Field<Il2CppObject *> recFieldClip;
     Field<bool> recFieldLoop;
@@ -167,6 +168,7 @@ static bool Lookups() {
             G.asSetLoop = asrc.GetMethod("set_loop", 1);
             G.asPlay = asrc.GetMethod("Play", 0);
             G.asStop = asrc.GetMethod("Stop", 0);
+            G.asIsPlaying = asrc.GetMethod("get_isPlaying", 0);
         }
         Class rec("Photon.Voice.Unity", "Recorder");
         if (rec.IsValid()) {
@@ -181,6 +183,7 @@ static bool Lookups() {
             G.recGetVad = rec.GetMethod("get_VoiceDetection", 0);
             G.recSetRecording = rec.GetMethod("set_IsRecording", 1);
             G.recGetRecording = rec.GetMethod("get_IsRecording", 0);
+            G.recGetSending = rec.GetMethod("get_IsCurrentlyTransmitting", 0);   // true only while audio really goes out
             G.recSetOnlyWhenEnabled = rec.GetMethod("set_RecordOnlyWhenEnabled", 1);
             G.recStart = rec.GetMethod("StartRecording", 0);
             G.recFieldSource = rec.GetField("sourceType");
@@ -485,8 +488,8 @@ static void OverpoweredOff();
 static void NextWeatherIntensity();
 static void TodPicked();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -508,6 +511,7 @@ static Item g_items[] = {
     {MAIN, "Enabled Mods", OPEN, ENABLED},
     {MAIN, "Emotes", OPEN, EMOTES},
     {MAIN, "Credits", OPEN, CREDITS},
+    {MAIN, "Beta Testers", OPEN, BETA},
 
     {MOVEMENT, "Exit Movement Mods", OPEN, MAIN},
     {MOVEMENT, "Platforms", TOGGLE, MAIN, &f_platforms},
@@ -606,6 +610,12 @@ static Item g_items[] = {
 
     {CREDITS, "Exit Credits", OPEN, MAIN},
     {CREDITS, "@CampDaBell", ACTION, MAIN, nullptr, nullptr},
+
+    {BETA, "Exit Beta Testers", OPEN, MAIN},
+    {BETA, "@CampDaBell", ACTION, MAIN, nullptr, nullptr},
+    {BETA, "@cart3rrrrr", ACTION, MAIN, nullptr, nullptr},
+    {BETA, "@mrbeast1479", ACTION, MAIN, nullptr, nullptr},
+    // Add a tester: {BETA, "Their Name", ACTION, MAIN, nullptr, nullptr},
 };
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
@@ -616,6 +626,9 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Movement Mods", "Opens the movement mods."},
     {"Enabled Mods", "Shows every mod you have on."},
     {"Credits", "Who made this menu."},
+    {"Beta Testers", "The people who test ClientDaBell."},
+    {"@cart3rrrrr", "Beta tester."},
+    {"@mrbeast1479", "Beta tester."},
     {"@CampDaBell", "The menu is made by @CampDaBell."},
     {"Platforms", "Hold a grip to stand on a platform."},
     {"Fly", "Hold A to fly where you look."},
@@ -651,7 +664,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Spaz", "Hands shake all over the place. Hold left trigger."},
     {"Beyblade", "Hands spin fast around your waist. Hold left trigger."},
     {"Soundboard", "Plays .wav songs from the sounds folder, through your voice chat."},
-    {"Others Hear It", "On: the room hears the song through your mic. Off: only you hear it."},
+    {"Others Hear It", "On: the room hears the song through your mic. Off: only you hear it. Turning it back on mid-song restarts the song for the room."},
     {"Next Song", "Picks the next song in the list."},
     {"Previous Song", "Picks the previous song in the list."},
     {"Stop Sound", "Stops the song (and cancels a loading one)."},
@@ -2022,12 +2035,18 @@ static void MicApply(Il2CppObject *r, Il2CppObject *clip) {
     if (G.recSetRecording.IsValid()) G.recSetRecording[r](true);
     RecRestart(r);
 }
-static bool MicTookHold(Il2CppObject *r) {
+// The recorder's settings say it's on the song (source, recording, transmit).
+static bool MicSettingsOk(Il2CppObject *r) {
     if (!Alive(r)) return false;
     bool src = !G.recGetSource.IsValid() || G.recGetSource[r]() == 1;
     bool rec = !G.recGetRecording.IsValid() || G.recGetRecording[r]();
     bool tx = !G.recGetTransmit.IsValid() || G.recGetTransmit[r]();
     return src && rec && tx;
+}
+// Sound is really going out (not just the settings): Photon Voice's IsCurrentlyTransmitting.
+static bool MicTookHold(Il2CppObject *r) {
+    if (!MicSettingsOk(r)) return false;
+    return !G.recGetSending.IsValid() || G.recGetSending[r]();
 }
 
 // Sends the loaded song to the room. Returns false if it only plays for you.
@@ -2061,19 +2080,48 @@ static bool MicStart() {
 }
 
 // Every frame: re-check a song that was just sent, and give the mic back when it's over.
+static bool g_songPlaying = false;              // a song was started and not stopped
+static double g_songEnd = 0;                    // when it ends if it isn't looping
+static double g_micResumeAt = 0;                // "Others Hear It" was turned back on: send the song again at this time
+static bool SongStillPlaying() {
+    Il2CppObject *src = g_audioSrc.get();
+    if (!g_songPlaying || g_clipSong < 0 || g_load.f || !Alive(src) || !Alive(g_clip.get())) return false;
+    if (G.asIsPlaying.IsValid()) return G.asIsPlaying[src]();
+    return f_soundLoop || g_time < g_songEnd;
+}
+
+// Every frame: send the song again after "Others Hear It" comes back on, check that a song
+// that was just sent really goes out, and give the mic back when it's over.
 static void SoundTick() {
+    if (g_micResumeAt > 0 && g_time >= g_micResumeAt) {
+        g_micResumeAt = 0;
+        if (f_soundMic && SongStillPlaying()) {
+            // Voice chat can only play the song from the start, so it restarts for you too
+            // (you and the room hear the same part).
+            G.asPlay[g_audioSrc.get()]();
+            g_songEnd = g_time + g_clipLen;
+            if (MicStart()) Notify("Sending the song to the room...");
+            else Notify("Voice chat not found, only you hear it");
+        }
+    }
     if (!g_micOn) return;
     if (!f_soundLoop && g_micUntil > 0 && g_time >= g_micUntil) { MicStop(); return; }
     if (g_micCheckAt <= 0 || g_time < g_micCheckAt) return;
     Il2CppObject *r = g_recorder.get();
     if (MicTookHold(r)) {
-        if (g_micTries > 0) Notify("The room hears it now");
+        Notify("The room hears it");
         ym::log("clientdabell: voice check ok (after %d retries)", g_micTries);
         g_micCheckAt = 0;
         return;
     }
-    if (g_micTries >= 4) {
-        ym::log("clientdabell: voice chat wouldn't take the song, giving the mic back");
+    if (g_micTries >= 5 && MicSettingsOk(r)) {         // set up right, but no sign of sound going out: keep it, say so
+        ym::log("clientdabell: voice set to the song but not confirmed sending");
+        Notify("Sent to voice chat, couldn't confirm the room hears it");
+        g_micCheckAt = 0;
+        return;
+    }
+    if (g_micTries >= 5) {
+        ym::log("clientdabell: voice chat wouldn't send the song, giving the mic back");
         Notify("Voice chat didn't take it, only you hear it");
         MicStop();
         return;
@@ -2082,14 +2130,28 @@ static void SoundTick() {
     if (!Alive(r)) { g_recorder.clear(); r = FindRecorder(); }
     Il2CppObject *clip = g_clip.get();
     if (!r || !Alive(clip)) { g_micCheckAt = g_time + 0.75; return; }
-    ym::log("clientdabell: voice didn't take (source=%d recording=%d), retry %d", G.recGetSource.IsValid() ? G.recGetSource[r]() : -1,
-            G.recGetRecording.IsValid() ? (int)G.recGetRecording[r]() : -1, g_micTries);
-    try { MicApply(r, clip); } catch (...) {}
+    ym::log("clientdabell: voice not sending yet (source=%d recording=%d sending=%d), try %d", G.recGetSource.IsValid() ? G.recGetSource[r]() : -1,
+            G.recGetRecording.IsValid() ? (int)G.recGetRecording[r]() : -1, G.recGetSending.IsValid() ? (int)G.recGetSending[r]() : -1, g_micTries);
+    // Settings right but no sound out yet: give Photon a moment before restarting it again
+    // (restarting over and over can keep it from ever starting).
+    if (!(MicSettingsOk(r) && g_micTries <= 2)) { try { MicApply(r, clip); } catch (...) {} }
     g_micCheckAt = g_time + 0.75;
 }
 static void SoundMicToggled() {
-    if (!f_soundMic) MicStop();
-    Notify(f_soundMic ? "Soundboard: the room hears it" : "Soundboard: only you hear it");
+    if (!f_soundMic) {
+        g_micResumeAt = 0;
+        MicStop();
+        Notify("Soundboard: only you hear it");
+        return;
+    }
+    if (SongStillPlaying()) {
+        // Wait a moment: the recorder was just switched back to your mic, and switching it
+        // to the song again in the same moment can leave it sending nothing.
+        g_micResumeAt = g_time + 0.6;
+        Notify("Soundboard: the room will hear it (song restarts)");
+        return;
+    }
+    Notify("Soundboard: the room hears your next song");
 }
 
 static void PlayLoaded() {
@@ -2100,8 +2162,12 @@ static void PlayLoaded() {
     if (G.asSetSpatial.IsValid()) G.asSetSpatial[src](0.0f);          // 2D: heard in your head, wherever you walk
     if (G.asSetLoop.IsValid()) G.asSetLoop[src](f_soundLoop);
     G.asPlay[src]();
+    g_songPlaying = true;
+    g_songEnd = g_time + g_clipLen;
+    g_micResumeAt = 0;
     bool room = MicStart();
-    Notify(room ? "Playing %.30s (room hears it)" : f_soundMic ? "Playing %.30s (voice chat not found, only you)" : "Playing %.30s",
+    // "room hears it" only comes once the check sees sound going out (see SoundTick)
+    Notify(room ? "Playing %.30s (sending to the room...)" : f_soundMic ? "Playing %.30s (voice chat not found, only you)" : "Playing %.30s",
            SongTitle(g_clipSong).c_str());
 }
 
@@ -2222,6 +2288,8 @@ static void StopSound() {
     if (g_clipSong < 0 && Alive(g_clip.get())) { G.destroy(g_clip.get()); g_clip.clear(); }   // a half-loaded clip is useless
     Il2CppObject *src = g_audioSrc.get();
     if (Alive(src) && G.asStop.IsValid()) G.asStop[src]();
+    g_songPlaying = false;
+    g_micResumeAt = 0;
     MicStop();
 }
 static void ApplyLoop() {
