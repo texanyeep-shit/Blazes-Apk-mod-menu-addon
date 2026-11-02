@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v.1.2.5 Patch #2"
+#define CDB_VERSION "v.1.2.5 Patch #3"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -2148,6 +2148,9 @@ static bool MicStart() {
 static bool g_songPlaying = false;              // a song was started and not stopped
 static double g_songEnd = 0;                    // when it ends if it isn't looping
 static double g_micResumeAt = 0;                // "Others Hear It" was turned back on: send the song again at this time
+static double g_micRetryAt = 0;                 // no recorder sent anything: try them all once more at this time
+static double g_micWatchAt = 0;                 // next check that the game hasn't switched voice back to your mic
+static int g_micRound = 0;                      // 0: first try through the recorders, 1: the second
 static bool SongStillPlaying() {
     Il2CppObject *src = g_audioSrc.get();
     if (!g_songPlaying || g_clipSong < 0 || g_load.f || !Alive(src) || !Alive(g_clip.get())) return false;
@@ -2160,6 +2163,8 @@ static bool SongStillPlaying() {
 static void SoundTick() {
     if (g_micResumeAt > 0 && g_time >= g_micResumeAt) {
         g_micResumeAt = 0;
+        g_micRound = 0;
+        g_micRetryAt = 0;
         if (f_soundMic && SongStillPlaying()) {
             // Voice chat can only play the song from the start, so it restarts for you too
             // (you and the room hear the same part).
@@ -2169,9 +2174,28 @@ static void SoundTick() {
             else Notify("Voice chat not found, only you hear it");
         }
     }
+    if (g_micRetryAt > 0 && g_time >= g_micRetryAt) {   // second try, after voice chat had a moment to settle
+        g_micRetryAt = 0;
+        if (f_soundMic && SongStillPlaying() && !g_micOn) {
+            g_recorder.clear();
+            if (MicStart()) Notify("Trying voice chat again...");
+        }
+    }
     if (!g_micOn) return;
     if (!f_soundLoop && g_micUntil > 0 && g_time >= g_micUntil) { MicStop(); return; }
-    if (g_micCheckAt <= 0 || g_time < g_micCheckAt) return;
+    if (g_micCheckAt <= 0) {                            // it worked: keep an eye on it while the song plays
+        if (g_time < g_micWatchAt) return;
+        g_micWatchAt = g_time + 0.5;
+        Il2CppObject *wr = g_recorder.get();
+        if (Alive(wr) && !MicSettingsOk(wr)) {           // the game switched voice back (push to talk, mute...)
+            ym::log("clientdabell: the game switched voice chat back to the mic, putting the song back");
+            try { MicApply(wr, g_clip.get()); } catch (...) {}
+            g_micCheckAt = g_time + 0.6;
+            g_micTries = 0;
+        }
+        return;
+    }
+    if (g_time < g_micCheckAt) return;
     Il2CppObject *r = g_recorder.get();
     if (MicTookHold(r)) {
         Notify("The room hears it");
@@ -2188,6 +2212,15 @@ static void SoundTick() {
         MicStop();                                      // gives this one its mic settings back
         Il2CppObject *nr = g_recCand[next].get();
         if (Alive(nr) && MicBegin(nr)) Notify("Trying voice %d of %d...", next + 1, g_recCandN);
+        return;
+    }
+    if (g_micTries >= 5 && g_micRound == 0 && g_recCandN > 0) {   // none of them sent: voice chat may not be ready yet, try all again soon
+        ym::log("clientdabell: no recorder sent the song, trying them all again in a moment");
+        g_micRound = 1;
+        g_goodRec.clear();
+        MicStop();
+        g_micRetryAt = g_time + 1.5;
+        Notify("Voice chat not ready, trying again...");
         return;
     }
     if (g_micTries >= 5 && MicSettingsOk(r)) {         // set up right, but no sign of sound going out: keep it, say so
@@ -2222,6 +2255,7 @@ static void SoundTick() {
 static void SoundMicToggled() {
     if (!f_soundMic) {
         g_micResumeAt = 0;
+        g_micRetryAt = 0;
         MicStop();
         Notify("Soundboard: only you hear it");
         return;
@@ -2247,6 +2281,8 @@ static void PlayLoaded() {
     g_songPlaying = true;
     g_songEnd = g_time + g_clipLen;
     g_micResumeAt = 0;
+    g_micRetryAt = 0;
+    g_micRound = 0;
     bool room = MicStart();
     // "room hears it" only comes once the check sees sound going out (see SoundTick)
     Notify(room ? "Playing %.30s (sending to the room...)" : f_soundMic ? "Playing %.30s (voice chat not found, only you)" : "Playing %.30s",
@@ -2372,6 +2408,7 @@ static void StopSound() {
     if (Alive(src) && G.asStop.IsValid()) G.asStop[src]();
     g_songPlaying = false;
     g_micResumeAt = 0;
+    g_micRetryAt = 0;
     MicStop();
 }
 static void ApplyLoop() {
