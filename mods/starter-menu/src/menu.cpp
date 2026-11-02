@@ -89,7 +89,8 @@ static struct {
     Method<Il2CppObject *> trGetParent, trGetRoot, getComponentsInChildren, netLocal;
     Method<void> pvRpc;
     Method<Il2CppObject *> audioClipCreate;           // soundboard
-    Method<bool> audioClipSetData;
+    Method<bool> audioClipSetData, audioClipGetData;
+    Method<int> audioClipSamples, asGetTimeSamples;
     Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
     Method<bool> asIsPlaying;
     BNM::MonoType *tAudioSource = nullptr;
@@ -160,6 +161,8 @@ static bool Lookups() {
         if (aclip.IsValid()) {
             G.audioClipCreate = Overload(aclip, "Create", {"System.String", "System.Int32", "System.Int32", "System.Int32", "System.Boolean"});
             G.audioClipSetData = aclip.GetMethod("SetData", 2);
+            G.audioClipGetData = aclip.GetMethod("GetData", 2);           // Overlap Songs: reads a song back to mix it
+            G.audioClipSamples = aclip.GetMethod("get_samples", 0);
         }
         if (asrc.IsValid()) {
             G.tAudioSource = asrc.GetMonoType();
@@ -169,6 +172,7 @@ static bool Lookups() {
             G.asSetLoop = asrc.GetMethod("set_loop", 1);
             G.asPlay = asrc.GetMethod("Play", 0);
             G.asStop = asrc.GetMethod("Stop", 0);
+            G.asGetTimeSamples = asrc.GetMethod("get_timeSamples", 0);     // where the song is now
             G.asIsPlaying = asrc.GetMethod("get_isPlaying", 0);
         }
         Class rec("Photon.Voice.Unity", "Recorder");
@@ -436,8 +440,9 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash;
+static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash, f_blockRain;
 static bool f_soundMic = true;                  // soundboard goes out through your voice chat
+static bool f_overlap = false;                  // Play while a song plays mixes the two together
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
@@ -474,6 +479,7 @@ static void DancePicked();
 static void ArmDupe9();
 static void ArmDupe27();
 static void ArmDupe9x3();
+static void ItemRain();
 static bool LeftHandItem();
 static void ScanSongs();
 static void PlaySong();
@@ -562,6 +568,8 @@ static Item g_items[] = {
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
     {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
     {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
+    {ITEMS, "Item Rain", ACTION, MAIN, nullptr, ItemRain},
+    {ITEMS, "Block Rain", TOGGLE, MAIN, &f_blockRain},
 
     {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
     {SOUNDBOARD, g_soundLabel, ACTION, MAIN, nullptr, PlaySong},
@@ -570,6 +578,7 @@ static Item g_items[] = {
     {SOUNDBOARD, "Stop Sound", ACTION, MAIN, nullptr, StopSound},
     {SOUNDBOARD, "Others Hear It", TOGGLE, MAIN, &f_soundMic, SoundMicToggled},
     {SOUNDBOARD, "Loop", TOGGLE, MAIN, &f_soundLoop, ApplyLoop},
+    {SOUNDBOARD, "Overlap Songs", TOGGLE, MAIN, &f_overlap},
     {SOUNDBOARD, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
     {SOUNDBOARD, "Rescan Songs", ACTION, MAIN, nullptr, ScanSongs},
 
@@ -658,6 +667,8 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
+    {"Block Rain", "Colorful blocks fall from the sky around you and pile up. Only you see them."},
+    {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
     {"Helicopter", "Both arms spin around you. Hold left trigger."},
     {"T-Pose", "The classic T-pose. Hold left trigger."},
@@ -672,6 +683,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Previous Song", "Picks the previous song in the list."},
     {"Stop Sound", "Stops the song (and cancels a loading one)."},
     {"Loop", "Repeats the song until you stop it."},
+    {"Overlap Songs", "On: Play while a song plays adds the new song on top. Both go through voice chat."},
     {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
     {"Rescan Songs", "Looks in the sounds folder again."},
     {"Effects", "Weather, discos and time of day. Only you see them."},
@@ -1799,6 +1811,22 @@ static bool LeftHandItem() {
 static void ArmDupe9() { if (LeftHandItem()) SpawnGrid(9); }
 static void ArmDupe27() { if (LeftHandItem()) SpawnGrid(27); }
 static void ArmDupe9x3() { if (LeftHandItem()) SpawnGridDims(9, 3, 1); }   // 27 in a row of 9, three deep
+// Item Rain: 32 copies of your left-hand item appear high above you, spread around, and fall.
+// One shower per press, through the same queue as the duplicates (3 s between showers, at
+// most 32 waiting, 2 sent per frame), so it never floods the room.
+static void ItemRain() {
+    Il2CppObject *head = g_head.get();
+    if (!head || !LeftHandItem()) return;
+    Vector3 hp = G.trGetPosition[head]();
+    std::vector<PendingItem> list;
+    for (int i = 0; i < 32; i++) {
+        float a = Rand01() * 6.2831853f, r = 0.5f + 4.5f * sqrtf(Rand01());
+        list.push_back({Vector3(hp.x + cosf(a) * r, hp.y + 5.0f + Rand01() * 4.0f, hp.z + sinf(a) * r), Vector3(0, -1.0f, 0)});
+    }
+    double before = g_nextBatch;
+    QueueItems(list);
+    if (g_nextBatch != before) Notify("Item Rain!");
+}
 
 // Spawn On Hand: each right-trigger press (grip open) spawns the item at your hand.
 static bool g_onHandTrigger = false;
@@ -1831,6 +1859,7 @@ static int g_songSel = 0, g_soundVol = 1, g_clipSong = -1;
 static const float kSoundVols[] = {0.3f, 0.6f, 1.0f};
 static const char *kSoundVolNames[] = {"quiet", "medium", "loud"};
 static Ref g_audioGo, g_audioSrc, g_clip, g_chunk;
+static bool g_overlapPending = false, g_clipMixed = false;   // Overlap Songs: waiting to mix / the clip is a mix
 
 struct Loader {
     FILE *f = nullptr;
@@ -2286,7 +2315,7 @@ static void PlayLoaded() {
     bool room = MicStart();
     // "room hears it" only comes once the check sees sound going out (see SoundTick)
     Notify(room ? "Playing %.30s (sending to the room...)" : f_soundMic ? "Playing %.30s (voice chat not found, only you)" : "Playing %.30s",
-           SongTitle(g_clipSong).c_str());
+           g_clipMixed ? "your mix" : SongTitle(g_clipSong).c_str());
 }
 
 static void StartLoad(int song, bool playAfter) {
@@ -2306,6 +2335,7 @@ static void StartLoad(int song, bool playAfter) {
     if (Alive(g_clip.get())) G.destroy(g_clip.get());               // frees the last song's memory
     g_clip.clear();
     g_clipSong = -1;
+    g_clipMixed = false;
     Il2CppObject *clip = G.audioClipCreate(CreateMonoString(SongTitle(song).c_str()), (int)L.outFrames, 1, (int)kVoiceRate, false);
     Il2CppObject *chunk = (Il2CppObject *)G.arrayNew(G.floatClass, kChunkFrames);
     if (!clip || !chunk) { fclose(L.f); Notify("Not enough memory for that song"); return; }
@@ -2322,9 +2352,83 @@ static void StartLoad(int song, bool playAfter) {
     Notify("Loading %.30s", SongTitle(song).c_str());
 }
 
+// ---- Overlap Songs: two songs at once ------------------------------------------------
+// Voice chat can only send one sound, so two songs are mixed into one clip and that clip
+// is sent (and played for you). When you press Play while a song plays (with Overlap Songs
+// on), the playing song is kept, the new one loads as usual, and then both are mixed a
+// slice per frame: the playing song from where it is now, the new one from its start. When
+// the mix is ready it replaces the song for you and the room. A third song mixes onto the
+// mix the same way. The mixed clip is at most kMaxSeconds long.
+static constexpr uint32_t kMixChunk = 131072;            // samples mixed per game frame
+static Ref g_baseClip, g_mixClip, g_mixA, g_mixB;
+static int g_baseOffset = 0;                           // where the playing song was when Play was pressed
+static struct { bool active = false; int outLen = 0, done = 0, baseLen = 0, newLen = 0; } g_mix;
+
+static void MixAbort() {
+    if (g_mix.active && Alive(g_mixClip.get())) G.destroy(g_mixClip.get());
+    g_mixClip.clear(); g_mixA.clear(); g_mixB.clear();
+    g_mix.active = false;
+    g_overlapPending = false;
+}
+static bool CanOverlap() {
+    return f_overlap && G.audioClipGetData.IsValid() && G.audioClipSamples.IsValid() && G.asGetTimeSamples.IsValid() &&
+           G.audioClipCreate.IsValid() && G.audioClipSetData.IsValid() && G.arrayNew && G.floatClass;
+}
+// The new song finished loading: start mixing it with the one that is playing.
+static void StartMix() {
+    Il2CppObject *base = g_baseClip.get(), *add = g_clip.get();
+    if (!Alive(base) || !Alive(add)) { PlayLoaded(); return; }
+    g_mix.baseLen = G.audioClipSamples[base]();
+    g_mix.newLen = G.audioClipSamples[add]();
+    int remA = std::max(0, g_mix.baseLen - g_baseOffset);
+    int out = std::min(std::max(remA, g_mix.newLen), (int)(kMaxSeconds * kVoiceRate));
+    Il2CppObject *mix = out > 0 ? G.audioClipCreate(CreateMonoString("ClientDaBellMix"), out, 1, (int)kVoiceRate, false) : nullptr;
+    Il2CppObject *a = (Il2CppObject *)G.arrayNew(G.floatClass, kMixChunk), *b = (Il2CppObject *)G.arrayNew(G.floatClass, kMixChunk);
+    if (!mix || !a || !b) { Notify("Not enough memory to overlap, playing the new song"); g_baseClip.clear(); PlayLoaded(); return; }
+    g_mixClip.set(mix); g_mixA.set(a); g_mixB.set(b);
+    g_mix.outLen = out; g_mix.done = 0; g_mix.active = true;
+    Notify("Mixing the songs...");
+}
+static void MixTick() {
+    if (!g_mix.active) return;
+    Il2CppObject *base = g_baseClip.get(), *add = g_clip.get(), *mix = g_mixClip.get(), *a = g_mixA.get(), *b = g_mixB.get();
+    if (!Alive(base) || !Alive(add) || !Alive(mix) || !a || !b) { MixAbort(); g_baseClip.clear(); return; }
+    int n = std::min((int)kMixChunk, g_mix.outLen - g_mix.done);
+    float *pa = (float *)((uint8_t *)a + 0x20), *pb = (float *)((uint8_t *)b + 0x20);
+    // GetData wraps around to the start past the end, so only the samples before the end are used
+    int posA = g_baseOffset + g_mix.done, validA = std::max(0, std::min(n, g_mix.baseLen - posA));
+    int validB = std::max(0, std::min(n, g_mix.newLen - g_mix.done));
+    if (validA > 0) G.audioClipGetData[base](a, posA);
+    if (validB > 0) G.audioClipGetData[add](b, g_mix.done);
+    Il2CppObject *outArr = n == (int)kMixChunk ? a : (Il2CppObject *)G.arrayNew(G.floatClass, (uintptr_t)n);
+    if (!outArr) { MixAbort(); g_baseClip.clear(); Notify("Not enough memory to overlap"); return; }
+    float *po = (float *)((uint8_t *)outArr + 0x20);
+    for (int i = 0; i < n; i++) {
+        float v = (i < validA ? pa[i] : 0.0f) * 0.75f + (i < validB ? pb[i] : 0.0f) * 0.75f;   // a bit quieter so the sum doesn't clip
+        po[i] = v > 1 ? 1.f : v < -1 ? -1.f : v;
+    }
+    G.audioClipSetData[mix](outArr, g_mix.done);
+    g_mix.done += n;
+    if (g_mix.done < g_mix.outLen) return;
+    // Done: switch you and the room to the mix, then free the two old clips.
+    Ref oldBase, oldAdd;
+    oldBase.set(base); oldAdd.set(add);
+    g_clip.set(mix);
+    g_clipLen = (double)g_mix.outLen / kVoiceRate;
+    g_clipMixed = true;
+    g_mix.active = false;
+    g_mixClip.clear(); g_mixA.clear(); g_mixB.clear(); g_baseClip.clear();
+    PlayLoaded();                                       // plays the mix and sends it (replaces the recorder's clip)
+    if (Alive(oldBase.get())) G.destroy(oldBase.get());
+    if (Alive(oldAdd.get())) G.destroy(oldAdd.get());
+    oldBase.clear(); oldAdd.clear();
+    ym::log("clientdabell: overlap mix ready, %.1f s", g_clipLen);
+}
+
 // Called every frame: reads the next slice of the song, mixes it to mono, converts it to
 // 48 kHz (straight-line between samples) and writes 32k frames into the clip.
 static void LoadTick() {
+    MixTick();
     Loader &L = g_load;
     if (!L.f) return;
     Il2CppObject *clip = g_clip.get();
@@ -2389,14 +2493,30 @@ static void LoadTick() {
         ym::log("clientdabell: loaded %s, %u Hz -> 48000 Hz, %.1f s", g_songs[song].c_str(), L.rate, g_clipLen);
         AbortLoad();
         g_clipSong = song;
-        if (play) PlayLoaded();
+        if (play) {
+            if (g_overlapPending && Alive(g_baseClip.get())) StartMix();
+            else PlayLoaded();
+        }
+        g_overlapPending = false;
     }
 }
 
 static void PlaySong() {
     if (g_songs.empty()) { Notify("Put .wav files in the sounds folder, then Rescan"); return; }
-    if (g_load.f) { Notify("Still loading, one moment"); return; }
-    if (g_clipSong == g_songSel && Alive(g_clip.get())) PlayLoaded();
+    if (g_load.f || g_mix.active) { Notify("Still loading, one moment"); return; }
+    if (CanOverlap() && SongStillPlaying()) {           // Overlap Songs: keep this one playing, add the new one on top
+        Il2CppObject *src = g_audioSrc.get(), *base = g_clip.get();
+        g_baseOffset = std::max(0, G.asGetTimeSamples[src]());
+        g_baseClip.set(base);
+        g_clip.clear();                                  // so loading the new song doesn't free the playing one
+        g_clipSong = -1;
+        StartLoad(g_songSel, true);
+        if (g_load.f) { g_overlapPending = true; return; }
+        g_clip.set(base);                                // couldn't load the new song: keep the old one going
+        g_baseClip.clear();
+        return;
+    }
+    if (g_clipSong == g_songSel && Alive(g_clip.get()) && !g_clipMixed) PlayLoaded();
     else StartLoad(g_songSel, true);
 }
 static void NextSong() { if (g_songs.empty()) return; g_songSel = (g_songSel + 1) % (int)g_songs.size(); UpdateSoundLabel(); }
@@ -2410,6 +2530,9 @@ static void StopSound() {
     g_micResumeAt = 0;
     g_micRetryAt = 0;
     MicStop();
+    MixAbort();                                         // after the recorder let go of the clips
+    if (Alive(g_baseClip.get()) && g_baseClip.get() != g_clip.get()) G.destroy(g_baseClip.get());
+    g_baseClip.clear();
 }
 static void ApplyLoop() {
     Il2CppObject *src = g_audioSrc.get();
@@ -3641,9 +3764,65 @@ static void OverpoweredReset() {                               // room change: t
     for (auto &r : g_ring) Kill(r);
 }
 
+// ---- Block Rain (Items page; only on your own game) ----------------------------------
+// Colorful cubes with physics fall from the sky around you, bounce and pile up. They are
+// plain local objects, not game items, so nothing is sent and only you see them. Hard limit
+// of kRainMax cubes: when the limit is reached the oldest one is picked up and dropped again
+// from the sky instead of making a new one. Turning it off removes them all.
+static constexpr int kRainMax = 40;
+static Ref g_rain[kRainMax], g_rainRb[kRainMax];
+static int g_rainMade = 0, g_rainNext = 0;
+static double g_rainAt = 0;
+static bool g_rainOn = false;
+
+static void RainClear() {
+    for (int i = 0; i < kRainMax; i++) { Kill(g_rain[i]); g_rainRb[i].clear(); }
+    g_rainMade = g_rainNext = 0;
+    g_rainAt = 0;
+    g_rainOn = false;
+}
+static void RainDrop(int i, Vector3 hp) {
+    Il2CppObject *o = g_rain[i].get();
+    if (!Alive(o)) return;
+    float a = Rand01() * 6.2831853f, r = 1.0f + 6.0f * sqrtf(Rand01()), size = 0.2f + Rand01() * 0.25f;
+    Il2CppObject *t = Tr(o);
+    G.trSetPosition[t](Vector3(hp.x + cosf(a) * r, hp.y + 7.0f + Rand01() * 4.0f, hp.z + sinf(a) * r));
+    float ang = Rand01() * 6.2831853f;
+    Vector3 ax(Rand01() - 0.5f, Rand01() - 0.5f, Rand01() - 0.5f);
+    float n = sqrtf(ax.x * ax.x + ax.y * ax.y + ax.z * ax.z);
+    if (n < 0.01f) { ax = Vector3(0, 1, 0); n = 1; }
+    float s2 = sinf(ang * 0.5f) / n;
+    G.trSetRotation[t](Quaternion(ax.x * s2, ax.y * s2, ax.z * s2, cosf(ang * 0.5f)));
+    G.trSetLocalScale[t](Vector3(size, size, size));
+    SetColor(o, Rainbow(Rand01()));
+    if (Il2CppObject *rb = g_rainRb[i].get()) G.rbSetVelocity[rb](Vector3(0, -2.0f, 0));
+}
+static void BlockRainTick() {
+    Il2CppObject *head = g_head.get();
+    if (!f_blockRain || !head) { if (g_rainOn) RainClear(); return; }
+    if (!g_rainOn) { g_rainOn = true; Notify("Block Rain on"); }
+    if (g_time < g_rainAt) return;
+    g_rainAt = g_time + 0.18;                            // about 5 blocks a second
+    Vector3 hp = G.trGetPosition[head]();
+    int i;
+    if (g_rainMade < kRainMax) {                         // make a new one (one at a time, never more than kRainMax)
+        Il2CppObject *o = Cube(Color(1, 1, 1, 1), true);
+        if (!o) return;
+        Il2CppObject *rb = G.tRigidbody ? G.goAddComponent[o](G.tRigidbody) : nullptr;
+        i = g_rainMade++;
+        g_rain[i].set(o);
+        if (rb) g_rainRb[i].set(rb);
+    } else {                                             // full: reuse the oldest
+        i = g_rainNext;
+        g_rainNext = (g_rainNext + 1) % kRainMax;
+    }
+    RainDrop(i, hp);
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
+    RainClear();
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
@@ -3710,6 +3889,8 @@ static void OnUpdate(float dt) {
     ApplyGravity();
     NoclipTick(in);
     TeleportGunTick(in);
+    try { BlockRainTick(); }
+    catch (...) { f_blockRain = false; try { RainClear(); } catch (...) {} ym::log("clientdabell: block rain error, turned off"); }
     try { SpawnOnHandTick(in); ItemQueueTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
     try { LoadTick(); SoundTick(); }
