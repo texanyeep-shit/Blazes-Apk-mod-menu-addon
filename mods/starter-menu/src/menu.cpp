@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v.1.2.6"
+#define CDB_VERSION "v.1.2.7"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -464,10 +464,14 @@ static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash, f_
 static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_overlap = false;                  // Play while a song plays mixes the two together
 static bool f_disableSongs = false;             // mute other players while they play music
+static bool f_colorBlind = false;               // Settings: on-buttons say [ON] and use colors everyone can tell apart
+static bool f_barkMode = false;                 // Settings: the menu is a panel in front of you instead of on your hand
+static bool g_rebuildMenu = false;              // Bark Mode switched: build the menu again next frame
+static bool g_barkPlaced = false;               // the Bark Mode panel has been put in front of you for this opening
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
-struct PendingItem { Vector3 pos, vel; bool drop = false; };   // drop: make it fall once it appears (Item Rain)
+struct PendingItem { Vector3 pos, vel; bool drop = false, orbit = false; };   // once it appears: drop it (Item Rain) / add it to Item Orbit
 static std::vector<PendingItem> g_itemQueue;
 static double g_nextItem = 0, g_nextBatch = 0;
 static int g_dupeArmed = 0;
@@ -501,6 +505,7 @@ static void ArmDupe9();
 static void ArmDupe27();
 static void ArmDupe9x3();
 static void ItemRain();
+static void ItemCircle();
 static void ItemOrbitToggled();
 static bool LeftHandItem();
 static void ScanSongs();
@@ -511,6 +516,7 @@ static void StopSound();
 static void ApplyLoop();
 static void NextSoundVolume();
 static void DisableSongsToggled();
+static void BarkModeToggled();
 static void SoundMicToggled();
 static void WeatherPicked();
 static void LongArmsToggled();
@@ -592,6 +598,7 @@ static Item g_items[] = {
     {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
     {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
     {ITEMS, "Item Rain", ACTION, MAIN, nullptr, ItemRain},
+    {ITEMS, "Item Circle", ACTION, MAIN, nullptr, ItemCircle},
     {ITEMS, "Item Orbit", TOGGLE, MAIN, &f_itemOrbit, ItemOrbitToggled},
 
     {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
@@ -637,8 +644,10 @@ static Item g_items[] = {
     {SETTINGS, "Iron Man Speed", ACTION, MAIN, nullptr, NextIronSpeed},
     {SETTINGS, "Car Speed", ACTION, MAIN, nullptr, NextCarSpeed},
     {SETTINGS, "Right Hand Menu", TOGGLE, MAIN, &f_rightHand, PointerToHand},
+    {SETTINGS, "Bark Mode", TOGGLE, MAIN, &f_barkMode, BarkModeToggled},
     {SETTINGS, "Change Menu Theme", ACTION, MAIN, nullptr, NextTheme},
     {SETTINGS, "Rainbow Menu", TOGGLE, MAIN, &f_rainbow},
+    {SETTINGS, "Color Blind Mode", TOGGLE, MAIN, &f_colorBlind},
     {SETTINGS, "Show FPS", TOGGLE, MAIN, &f_fps},
     {SETTINGS, "Show Clock", TOGGLE, MAIN, &f_clock},
     {SETTINGS, "Notifications", TOGGLE, MAIN, &f_notify},
@@ -655,12 +664,21 @@ static Item g_items[] = {
 };
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
+static void DisableAllMods();
+static bool f_modsPaused = false;               // Enabled Mods -> Disable All Mods is on: the mods that were on are saved here
+static std::vector<Item *> g_pausedMods;
+static Item g_disableAllItem = {ENABLED, "Disable All Mods", TOGGLE, MAIN, &f_modsPaused, DisableAllMods};
+// What the Enabled Mods page lists: switches that are on, except settings that aren't mods.
+static bool ListedAsMod(const Item &it) {
+    return it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_colorBlind && it.flag != &f_barkMode;
+}
 
 // Tooltips, shown under the menu while your finger is on a button (like ii's).
 static const struct { const char *label, *tip; } kTips[] = {
     {"Settings", "Opens the settings."},
     {"Movement Mods", "Opens the movement mods."},
     {"Enabled Mods", "Shows every mod you have on."},
+    {"Disable All Mods", "On: turns off every mod on this page. Off again: turns the same mods back on."},
     {"Credits", "Who made this menu."},
     {"Beta Testers", "The people who test ClientDaBell."},
     {"@cart3rrrrr", "Beta tester."},
@@ -682,6 +700,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Go To Spot", "Teleports you to your saved spot."},
     {"Change Menu Theme", "Plush Blue, Orange, Blue, Green, Purple, Dark."},
     {"Rainbow Menu", "The menu cycles through colors."},
+    {"Color Blind Mode", "Buttons that are on say [ON] and turn orange with dark text; pressed buttons flash white."},
     {"Show FPS", "Frames per second in the title."},
     {"Show Clock", "The time in the title."},
     {"Rig Mods", "Pick a dance, then hold left trigger. Everyone sees it."},
@@ -691,7 +710,8 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
-    {"Item Orbit", "Hold an item in your left hand, then turn this on: the item circles around you."},
+    {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you."},
+    {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
     {"Helicopter", "Both arms spin around you. Hold left trigger."},
@@ -744,6 +764,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
+    {"Bark Mode", "The menu opens as a big panel in front of you (like the bark menu) instead of on your hand."},
     {"Notifications", "Messages when you switch something."},
     {"Turn Everything Off", "Switches every mod off."},
 };
@@ -772,10 +793,33 @@ static const Theme &T() { return kThemes[g_theme]; }
 // Layout in meters, matching ii's menu as it was ported to Yeeps. Everything is drawn
 // on a "board" object: +x goes across, +y goes up, the player looks at it from -z.
 static constexpr int kRows = 8;                                   // buttons per page
-static const float kBoardW = 0.30f, kBoardH = 0.3825f, kBtnW = 0.27f, kBtnH = 0.0306f;
-static const float kHomeY = -0.2175f, kHomeW = 0.12f, kHomeH = 0.032f;   // Home button just under the board
-static const float kTitleY = 0.235f, kSideX = 0.2f, kSideW = 0.06f, kSideH = 0.344f;
-static float RowY(int r) { return 0.13f - r * 0.04f; }
+// These change with Bark Mode (SetLayout); the hand menu values are the defaults.
+static float kBoardW = 0.30f, kBoardH = 0.3825f, kBtnW = 0.27f, kBtnH = 0.0306f;
+static float kHomeY = -0.2175f, kHomeW = 0.12f, kHomeH = 0.032f;   // Home button just under the board
+static float kTitleY = 0.235f, kSideX = 0.2f, kSideW = 0.06f, kSideH = 0.344f;
+static int g_btnFont = 19, g_titleFont = 32;
+static bool g_barkLayout = false;                   // the menu is built as the Bark Mode panel
+// Bark Mode: a wide panel that floats in front of you (like Gorilla Tag's bark menu): the
+// title at the top, the version in the top-right corner, 8 buttons in 2 columns of 4, tall
+// < and > buttons inside the left and right edges, Home at the bottom.
+static void SetLayout(bool bark) {
+    g_barkLayout = bark;
+    if (bark) {
+        kBoardW = 0.62f; kBoardH = 0.42f; kBtnW = 0.20f; kBtnH = 0.058f;
+        kHomeY = -0.175f; kHomeW = 0.14f; kHomeH = 0.04f;
+        kTitleY = 0.165f; kSideX = 0.25f; kSideW = 0.05f; kSideH = 0.27f;
+        g_btnFont = 26; g_titleFont = 44;
+    } else {
+        kBoardW = 0.30f; kBoardH = 0.3825f; kBtnW = 0.27f; kBtnH = 0.0306f;
+        kHomeY = -0.2175f; kHomeW = 0.12f; kHomeH = 0.032f;
+        kTitleY = 0.235f; kSideX = 0.2f; kSideW = 0.06f; kSideH = 0.344f;
+        g_btnFont = 19; g_titleFont = 32;
+    }
+}
+// Where button r (0..7) sits: one column on the hand menu; in Bark Mode two columns,
+// left to right then down.
+static float RowY(int r) { return g_barkLayout ? 0.095f - (r / 2) * 0.072f : 0.13f - r * 0.04f; }
+static float RowX(int r) { return g_barkLayout ? (r % 2 ? 1.0f : -1.0f) * 0.112f : 0.0f; }
 
 static Ref g_menu, g_board, g_bg, g_outline, g_pointer, g_title, g_titleBar;
 static Ref g_rowCube[kRows], g_rowLabel[kRows], g_rowText[kRows];
@@ -793,11 +837,42 @@ static float g_fps = 0;
 
 static int PageCount() { return g_view.empty() ? 1 : (int)(g_view.size() + kRows - 1) / kRows; }
 
+// Enabled Mods -> Disable All Mods (a switch). On: every mod on that page is switched off the
+// normal way (the switch goes off, then its own off code runs) and remembered. Off: the
+// remembered ones are switched back on the same way.
+static void DisableAllMods() {
+    int n = 0;
+    if (f_modsPaused) {
+        g_pausedMods.clear();
+        for (auto &it : g_items) {
+            if (!ListedAsMod(it)) continue;
+            g_pausedMods.push_back(&it);
+            *it.flag = false;
+            if (it.fn) { try { it.fn(); } catch (...) {} }
+            n++;
+        }
+        Notify(n ? "Disabled %d mods" : "Nothing to disable", n);
+    } else {
+        for (Item *it : g_pausedMods) {
+            if (*it->flag) continue;                     // you turned it back on yourself already
+            *it->flag = true;
+            if (it->fn) { try { it->fn(); } catch (...) {} }
+            n++;
+        }
+        g_pausedMods.clear();
+        Notify(n ? "Turned %d mods back on" : "Nothing to turn back on", n);
+    }
+    g_dirty = true;
+}
+
 static void BuildView() {
     g_view.clear();
     if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
-        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic) g_view.push_back(&it);
+        bool any = f_modsPaused;                          // the switch stays while mods are saved
+        for (auto &it : g_items) any |= ListedAsMod(it);
+        if (any) g_view.push_back(&g_disableAllItem);
+        for (auto &it : g_items) if (ListedAsMod(it)) g_view.push_back(&it);
     } else {
         for (auto &it : g_items) if (it.cat == g_cat) g_view.push_back(&it);
     }
@@ -931,10 +1006,11 @@ static void BuildDecor(Il2CppObject *bt) {
         Decor(bt, 3, red, Vector3(-hw, y, z), Vector3(bar * 1.05f, 0.024f, 0.0125f), 0.0f);
         Decor(bt, 3, red, Vector3(hw, y, z), Vector3(bar * 1.05f, 0.024f, 0.0125f), 0.0f);
     }
-    CandyCane(bt, -kSideX, kTitleY, 1);
-    CandyCane(bt, kSideX, kTitleY, -1);
-    Pumpkin(bt, -kSideX, -0.215f);
-    Pumpkin(bt, kSideX, -0.215f);
+    float caneX = g_barkLayout ? kBoardW / 2 - 0.035f : kSideX, caneY = g_barkLayout ? kBoardH / 2 + 0.03f : kTitleY;
+    CandyCane(bt, -caneX, caneY, 1);
+    CandyCane(bt, caneX, caneY, -1);
+    Pumpkin(bt, -caneX, -kBoardH / 2 - 0.024f);
+    Pumpkin(bt, caneX, -kBoardH / 2 - 0.024f);
     ym::log("clientdabell: %d decorations", g_decorN);
 }
 
@@ -956,23 +1032,25 @@ static void BuildMenu() {
     g_outline.set(Part(bt, T().title, Vector3(0, 0, 0.004f), Vector3(kBoardW + 0.008f, kBoardH + 0.008f, 0.004f)));
     g_bg.set(Part(bt, T().bgA, Vector3(0, 0, 0), Vector3(kBoardW, kBoardH, 0.01f)));
     for (int r = 0; r < kRows; r++)
-        g_rowCube[r].set(Part(bt, T().button, Vector3(0, RowY(r), -0.005f), Vector3(kBtnW, kBtnH, 0.009f)));
+        g_rowCube[r].set(Part(bt, T().button, Vector3(RowX(r), RowY(r), -0.005f), Vector3(kBtnW, kBtnH, 0.009f)));
     g_prev.set(Part(bt, T().button, Vector3(-kSideX, 0, 0), Vector3(kSideW, kSideH, 0.009f)));
     // The title sits on its own dark bar above the board (where ii's Disconnect button was)
-    g_titleBar.set(Part(bt, T().buttonOn, Vector3(0, kTitleY, -0.002f), Vector3(kBtnW, 0.045f, 0.009f)));
+    // (Bark Mode: the title is written right on the panel, no bar)
+    if (!g_barkLayout) g_titleBar.set(Part(bt, T().buttonOn, Vector3(0, kTitleY, -0.002f), Vector3(kBtnW, 0.045f, 0.009f)));
     g_next.set(Part(bt, T().button, Vector3(kSideX, 0, 0), Vector3(kSideW, kSideH, 0.009f)));
     g_homeCube.set(Part(bt, T().button, Vector3(0, kHomeY, -0.005f), Vector3(kHomeW, kHomeH, 0.009f)));
 
-    if (Il2CppObject *canvas = Canvas(bt, Vector3(0, 0, -0.0105f), kBoardW + 2 * kSideX, kBoardH + 0.1f)) {
+    if (Il2CppObject *canvas = Canvas(bt, Vector3(0, 0, -0.0105f), std::max(kBoardW, 2 * kSideX + kSideW), kBoardH + 0.2f)) {
         Il2CppObject *ct = Tr(canvas);
-        Label(ct, "ClientDaBell", Vector3(0, kTitleY, 0), kBtnW, 0.045f, 32, &g_title);
+        Label(ct, "ClientDaBell", Vector3(0, kTitleY, 0), g_barkLayout ? 0.4f : kBtnW, g_barkLayout ? 0.06f : 0.045f, g_titleFont, &g_title);
         for (int r = 0; r < kRows; r++)
-            g_rowLabel[r].set(Label(ct, "", Vector3(0, RowY(r), 0), kBtnW, kBtnH, 19, &g_rowText[r]));
+            g_rowLabel[r].set(Label(ct, "", Vector3(RowX(r), RowY(r), 0), kBtnW - 0.01f, kBtnH, g_btnFont, &g_rowText[r]));
         Label(ct, "<", Vector3(-kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, ">", Vector3(kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
-        g_homeLabel.set(Label(ct, "Home", Vector3(0, kHomeY, 0), kHomeW, kHomeH, 19, nullptr));
-        Label(ct, "", Vector3(0, -kBoardH / 2 - 0.09f, 0), kBoardW, 0.03f, 17, &g_tipText);
-        Label(ct, CDB_VERSION, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
+        g_homeLabel.set(Label(ct, "Home", Vector3(0, kHomeY, 0), kHomeW, kHomeH, g_btnFont, nullptr));
+        Label(ct, "", Vector3(0, -kBoardH / 2 - (g_barkLayout ? 0.04f : 0.09f), 0), kBoardW, 0.03f, 17, &g_tipText);
+        if (g_barkLayout) Label(ct, CDB_VERSION, Vector3(kBoardW / 2 - 0.07f, kBoardH / 2 - 0.025f, 0), 0.12f, 0.025f, 16, nullptr);   // top-right corner
+        else Label(ct, CDB_VERSION, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
     }
     BuildDecor(bt);
     // Pointer: a small ball on the index finger of the other hand
@@ -1016,6 +1094,19 @@ static void RenderPage() {
         if (!used) continue;
         Item *it = g_view[i];
         bool on = it->kind == TOGGLE && *it->flag;
+        if (f_colorBlind) {
+            // Color Blind Mode: "on" doesn't depend on telling two shades apart. On buttons
+            // say [ON] and are orange with near-black text (orange against the blue themes is
+            // the pair the common kinds of color blindness all still tell apart, and the
+            // brightness differs a lot too); a press flashes white.
+            char lab[96];
+            snprintf(lab, sizeof lab, on ? "[ON] %s" : "%s", it->label);
+            SetText(g_rowText[r], lab);
+            SetColor(g_rowCube[r].get(), r == g_flashRow ? Color(1, 1, 1, 1) : on ? Color(0.90f, 0.62f, 0.0f, 1) : T().button);
+            if (Alive(g_rowText[r].get()))
+                G.graphicSetColor[g_rowText[r].get()](r == g_flashRow || on ? Color(0.08f, 0.08f, 0.08f, 1) : Color(1, 1, 1, 1));
+            continue;
+        }
         SetText(g_rowText[r], it->label);
         SetColor(g_rowCube[r].get(), r == g_flashRow ? Color(1, 0.9f, 0.6f, 1) : on ? T().buttonOn : T().button);
         if (Alive(g_rowText[r].get())) G.graphicSetColor[g_rowText[r].get()](on ? Color(1, 1, 1, 1) : T().title);
@@ -1027,7 +1118,7 @@ static void RenderPage() {
     SetColor(g_next.get(), T().button);
     Show(g_homeCube, g_cat != MAIN);
     Show(g_homeLabel, g_cat != MAIN);
-    SetColor(g_homeCube.get(), g_flashRow == -3 ? Color(1, 0.9f, 0.6f, 1) : T().button);
+    SetColor(g_homeCube.get(), g_flashRow == -3 ? (f_colorBlind ? Color(1, 1, 1, 1) : Color(1, 0.9f, 0.6f, 1)) : T().button);
     SetColor(g_outline.get(), T().title);
     SetColor(g_titleBar.get(), T().buttonOn);
     SetColor(g_pointer.get(), T().bgB);
@@ -1072,7 +1163,7 @@ static void UpdateTitle() {
 static void ShowMenu(bool show) {
     if (show == g_menuShown) return;
     g_menuShown = show;
-    if (show) { g_openTime = g_time; g_dirty = true; g_hover = -2; SetText(g_tipText, ""); }
+    if (show) { g_openTime = g_time; g_dirty = true; g_hover = -2; SetText(g_tipText, ""); g_barkPlaced = false; }
     Show(g_menu, show);
     Show(g_pointer, show);
     g_touching = -2;
@@ -1088,6 +1179,22 @@ static void PlaceMenu() {
     Il2CppObject *hand = f_rightHand ? g_rightHand.get() : g_leftHand.get();
     if (!Alive(menu) || !Alive(board) || !hand || !head) return;
     Il2CppObject *t = Tr(menu), *bt = Tr(board);
+    if (g_barkLayout) {                                  // Bark Mode: put once in front of you when it opens, then it stays
+        if (g_barkPlaced) return;
+        Vector3 hp = G.trGetPosition[head](), f = G.trGetForward[head]();
+        f.y = 0;
+        float n = sqrtf(f.x * f.x + f.z * f.z);
+        if (n < 1e-4f) return;
+        f = f * (1.0f / n);
+        Vector3 center = hp + f * 0.55f + Vector3(0, -0.18f, 0);
+        Vector3 tilt = f + Vector3(0, -0.35f, 0);           // tipped back a little, toward your eyes
+        G.trSetPosition[t](center);
+        G.trSetRotation[t](Quaternion(0, 0, 0, 1));
+        G.trSetPosition[bt](center);
+        G.trSetRotation[bt](Quaternion::LookRotation(tilt));
+        g_barkPlaced = true;
+        return;
+    }
     Vector3 handPos = G.trGetPosition[hand]();
     if (!G.trGetRotation.IsValid()) {                  // fallback: float above the hand, facing you
         Vector3 center = handPos + Vector3(0, 0.25f, 0), away = center - G.trGetPosition[head]();
@@ -1104,6 +1211,18 @@ static void PlaceMenu() {
     G.trSetRotation[t](rot);
     G.trSetLocalPosition[bt](Vector3(0.1f, 0, 0));
     G.trSetLocalRotation[bt](Quaternion::LookRotation(Vector3(-1, 0, 0), Vector3(0, 0, 1)));
+}
+
+// Bark Mode switched: the menu is torn down here and built again (with the other layout)
+// at the start of the next frame, so nothing is destroyed while it's being pressed.
+static void BarkModeToggled() { g_rebuildMenu = true; }
+static void RebuildMenuNow() {
+    g_rebuildMenu = false;
+    for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
+    for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText, &g_homeCube, &g_homeLabel}) r->clear();
+    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo}) Kill(*r);
+    g_built = false; g_menuShown = false; g_touching = -2; g_hover = -2;
+    SetLayout(f_barkMode);
 }
 
 static void Press(Item *it) {
@@ -1135,9 +1254,8 @@ static int Touching() {
     if (g_cat != MAIN && fabsf(p.x) < kHomeW / 2 && fabsf(p.y - kHomeY) < kHomeH / 2) return -3;
     if (fabsf(fabsf(p.x) - kSideX) < kSideW / 2 && fabsf(p.y) < kSideH / 2 && PageCount() > 1)
         return p.x < 0 ? -1 : kRows;
-    if (fabsf(p.x) >= kBtnW / 2) return -2;
     for (int r = 0; r < kRows; r++)
-        if (fabsf(p.y - RowY(r)) < kBtnH / 2) return r;
+        if (fabsf(p.x - RowX(r)) < kBtnW / 2 && fabsf(p.y - RowY(r)) < kBtnH / 2) return r;
     return -2;
 }
 
@@ -1241,9 +1359,11 @@ static int g_ironSpeed = 0;
 static void NextIronSpeed() { g_ironSpeed = (g_ironSpeed + 1) % 4; Notify("Iron Man speed: %d", (int)kIronSpeeds[g_ironSpeed]); }
 static void NextTheme() { g_theme = (g_theme + 1) % kThemeCount; Notify("Theme: %s", T().name); }
 static void AllOff() {
-    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_soundMic) *it.flag = false;   // ticks undo each mod
+    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_colorBlind && it.flag != &f_barkMode) *it.flag = false;   // ticks undo each mod
     g_dance = -1;
     g_dupeArmed = 0;
+    f_modsPaused = false;                           // nothing to bring back after this
+    g_pausedMods.clear();
     g_wx = -1;
     g_tod = -1;
     StopSound();
@@ -1787,14 +1907,16 @@ static void QueueItems(const std::vector<PendingItem> &list) {
 // Item Rain: the game spawns items floating where they appear, so each rained item is found
 // once it exists (by its ID) and dropped: the game's own drop call, then gravity on and a
 // push down. The scene search runs 4 times a second, only while items are waiting.
-struct DropWatch { char id[8]; double until; };
+struct DropWatch { char id[8]; double until; bool orbit; };
+static void OrbitAdd(Il2CppObject *it);
 static std::vector<DropWatch> g_dropWatch;
 static double g_nextDropScan = 0;
-static void DropWatchAdd(const char *id) {
+static void DropWatchAdd(const char *id, bool orbit = false) {
     if (g_dropWatch.size() >= 64) return;
     DropWatch w{};
     snprintf(w.id, sizeof w.id, "%s", id);
     w.until = g_time + 3.0;
+    w.orbit = orbit;
     g_dropWatch.push_back(w);
 }
 static void DropItem(Il2CppObject *it) {
@@ -1827,7 +1949,8 @@ static void DropWatchTick() {
         std::string id = s->str();
         for (size_t k = 0; k < g_dropWatch.size(); k++) {
             if (id != g_dropWatch[k].id) continue;
-            DropItem(it);
+            if (g_dropWatch[k].orbit) OrbitAdd(it);
+            else DropItem(it);
             g_dropWatch.erase(g_dropWatch.begin() + k);
             break;
         }
@@ -1840,7 +1963,7 @@ static void ItemQueueTick() {
         g_itemQueue.erase(g_itemQueue.begin());
         char id[8] = {};
         bool ok = SendItem(g_itemKey, p.pos, Quaternion(0, 0, 0, 1), p.vel, id);
-        if (ok && p.drop) DropWatchAdd(id);
+        if (ok && (p.drop || p.orbit)) DropWatchAdd(id, p.orbit);
         static int logged = 0;
         if (logged++ < 3) ym::log("clientdabell: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
         if (!ok) { g_itemQueue.clear(); Notify("Item spawning isn't ready in this room"); }
@@ -1908,13 +2031,35 @@ static void ItemRain() {
     if (g_nextBatch != before) Notify("Item Rain!");
 }
 
-// Item Orbit: the item in your left hand is let go (the game's own drop) and then moved in a
-// circle around you every frame, about 1 m out at chest height, bobbing and spinning. Its
-// physics is paused while it orbits; turning Item Orbit off (or grabbing the item) gives it
-// back its physics, so it drops.
-static Ref g_orbitItem, g_orbitRb;
+// Item Circle: 32 copies of your left-hand item in a ring around you at waist height, about
+// 0.45 m apart (so 2.3 m out). 32 is as many as the queue holds; same limits as the duplicates.
+static void ItemCircle() {
+    Il2CppObject *head = g_head.get();
+    if (!head || !LeftHandItem()) return;
+    Vector3 hp = G.trGetPosition[head]();
+    const int count = 32;
+    const float radius = count * 0.45f / 6.2831853f;
+    std::vector<PendingItem> list;
+    for (int i = 0; i < count; i++) {
+        float a = i * 6.2831853f / count;
+        list.push_back({Vector3(hp.x + cosf(a) * radius, hp.y - 0.6f, hp.z + sinf(a) * radius), Vector3(0, 0, 0)});
+    }
+    double before = g_nextBatch;
+    QueueItems(list);
+    if (g_nextBatch != before) Notify("Item Circle!");
+}
+
+// Item Orbit: as many items as possible circle around you. The item in your left hand is let
+// go (the game's own drop) and 31 copies of it are spawned (32 is as many as the item queue
+// holds, with the same limits as the duplicates); each copy joins the orbit as soon as it
+// appears. They're spread evenly around a circle at chest height that gets bigger with more
+// items, bobbing and spinning. Their physics is paused while they orbit; turning Item Orbit off
+// gives it back, so they drop. Grabbing one takes just that one out of the orbit.
+static constexpr int kOrbitMax = 32;
+static Ref g_orbitItem[kOrbitMax], g_orbitRb[kOrbitMax];
+static int g_orbitN = 0;
 static float g_orbitAng = 0;
-static double g_orbitStart = 0;
+static double g_orbitAdded[kOrbitMax];
 static Il2CppObject *ItemRigidbody(Il2CppObject *it) {
     Il2CppObject *go = Alive(it) ? G.compGameObject[it]() : nullptr;
     Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go](G.tRigidbody) : nullptr;
@@ -1924,50 +2069,85 @@ static Il2CppObject *ItemRigidbody(Il2CppObject *it) {
     }
     return Alive(rb) ? rb : nullptr;
 }
-static void OrbitRelease() {
-    Il2CppObject *rb = g_orbitRb.get();
+static void OrbitReleaseOne(int k) {                    // give item k its physics back and take it out
+    Il2CppObject *rb = g_orbitRb[k].get();
     if (Alive(rb)) {
         if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](false);
         if (G.rbSetUseGravity.IsValid()) G.rbSetUseGravity[rb](true);
     }
-    g_orbitItem.clear();
-    g_orbitRb.clear();
+    g_orbitItem[k].clear(); g_orbitRb[k].clear();
+    for (int m = k; m + 1 < g_orbitN; m++) {            // close the gap (move the handles down)
+        g_orbitItem[m].h = g_orbitItem[m + 1].h; g_orbitRb[m].h = g_orbitRb[m + 1].h; g_orbitAdded[m] = g_orbitAdded[m + 1];
+    }
+    if (g_orbitN > 0) { g_orbitItem[g_orbitN - 1].h = nullptr; g_orbitRb[g_orbitN - 1].h = nullptr; g_orbitN--; }
 }
-static void ItemOrbitToggled() {
-    if (!f_itemOrbit) { OrbitRelease(); Notify("Item Orbit off"); return; }
-    if (!LeftHandItem() || !Alive(g_handItemObj)) { f_itemOrbit = false; g_dirty = true; return; }   // LeftHandItem said why
-    Il2CppObject *it = g_handItemObj;
-    try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}   // let go of it
-    g_orbitItem.set(it);
+static void OrbitRelease() {
+    while (g_orbitN > 0) { try { OrbitReleaseOne(g_orbitN - 1); } catch (...) { g_orbitItem[g_orbitN - 1].h = g_orbitRb[g_orbitN - 1].h = nullptr; g_orbitN--; } }
+    for (auto &w : g_dropWatch) w.until = 0;           // copies still on their way won't join
+}
+static void OrbitAdd(Il2CppObject *it) {
+    if (!f_itemOrbit || !Alive(it) || g_orbitN >= kOrbitMax) return;
+    for (int k = 0; k < g_orbitN; k++) if (g_orbitItem[k].get() == it) return;
+    int k = g_orbitN++;
+    g_orbitItem[k].set(it);
     Il2CppObject *rb = ItemRigidbody(it);
     if (rb) {
-        g_orbitRb.set(rb);
+        g_orbitRb[k].set(rb);
         if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);   // we move it, not physics
     }
+    g_orbitAdded[k] = g_time;
+}
+static float OrbitRadius() { return std::max(1.0f, g_orbitN * 0.35f / 6.2831853f); }   // about 0.35 m between items
+static void ItemOrbitToggled() {
+    if (!f_itemOrbit) { OrbitRelease(); Notify("Item Orbit off"); return; }
+    Il2CppObject *head = g_head.get();
+    if (!head || !LeftHandItem() || !Alive(g_handItemObj)) { f_itemOrbit = false; g_dirty = true; return; }   // LeftHandItem said why
+    Il2CppObject *it = g_handItemObj;
+    try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}   // let go of it
+    OrbitAdd(it);
     g_orbitAng = 0;
-    g_orbitStart = g_time;
-    Notify("Item Orbit on");
+    // 31 copies, spawned on the ring they'll orbit on; each joins once it appears
+    Vector3 hp = G.trGetPosition[head]();
+    float r = std::max(1.0f, kOrbitMax * 0.35f / 6.2831853f);
+    std::vector<PendingItem> list;
+    for (int i = 1; i < kOrbitMax; i++) {
+        float a = i * 6.2831853f / kOrbitMax;
+        PendingItem p{Vector3(hp.x + cosf(a) * r, hp.y - 0.35f, hp.z + sinf(a) * r), Vector3(0, 0, 0)};
+        p.orbit = true;
+        list.push_back(p);
+    }
+    double before = g_nextBatch;
+    QueueItems(list);                                     // (says "Wait a moment" if you spawned items just now)
+    Notify(g_nextBatch != before ? "Item Orbit on (adding copies...)" : "Item Orbit on (1 item, wait to add copies)");
 }
 static void ItemOrbitTick(float dt) {
-    if (!f_itemOrbit) { if (g_orbitItem.get()) OrbitRelease(); return; }   // switched off some other way
-    Il2CppObject *it = g_orbitItem.get(), *head = g_head.get();
-    if (!Alive(it) || !head) { f_itemOrbit = false; g_dirty = true; OrbitRelease(); return; }
-    // grabbed again (after it had a moment to leave your hand): stop orbiting
-    if (g_time - g_orbitStart > 1.0 && G.itemHeld.IsValid() && G.itemHeld[it]()) {
-        f_itemOrbit = false; g_dirty = true; OrbitRelease(); Notify("Item Orbit off (grabbed)"); return;
+    if (!f_itemOrbit) { if (g_orbitN) OrbitRelease(); return; }   // switched off some other way
+    Il2CppObject *head = g_head.get();
+    if (!head) { f_itemOrbit = false; g_dirty = true; OrbitRelease(); return; }
+    for (int k = g_orbitN - 1; k >= 0; k--) {           // gone, or grabbed (after a moment to leave the hand): out of the orbit
+        Il2CppObject *it = g_orbitItem[k].get();
+        if (!Alive(it)) { OrbitReleaseOne(k); continue; }
+        if (g_time - g_orbitAdded[k] > 1.0 && G.itemHeld.IsValid() && G.itemHeld[it]()) OrbitReleaseOne(k);
     }
-    g_orbitAng += 2.2f * dt;                             // about one lap every 3 seconds
+    bool waiting = false;
+    for (auto &w : g_dropWatch) waiting |= w.orbit && g_time <= w.until;
+    if (g_orbitN == 0 && !waiting) { f_itemOrbit = false; g_dirty = true; Notify("Item Orbit off"); return; }
+    g_orbitAng += 1.6f * dt;                             // about one lap every 4 seconds
     if (g_orbitAng > 6.2831853f) g_orbitAng -= 6.2831853f;
     Vector3 hp = G.trGetPosition[head]();
-    Vector3 pos(hp.x + cosf(g_orbitAng) * 1.0f, hp.y - 0.35f + 0.12f * sinf(g_orbitAng * 2.0f), hp.z + sinf(g_orbitAng) * 1.0f);
-    Il2CppObject *t = G.compTransform[it]();
-    G.trSetPosition[t](pos);
-    float spin = (float)g_time * 3.0f;
-    G.trSetRotation[t](Quaternion(0, sinf(spin * 0.5f), 0, cosf(spin * 0.5f)));
-    Il2CppObject *rb = g_orbitRb.get();
-    if (Alive(rb)) {
-        if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);   // keep physics off if the game turns it back on
-        G.rbSetVelocity[rb](Vector3(0, 0, 0));
+    float r = OrbitRadius(), spin = (float)g_time * 3.0f;
+    Quaternion rot(0, sinf(spin * 0.5f), 0, cosf(spin * 0.5f));
+    for (int k = 0; k < g_orbitN; k++) {
+        float a = g_orbitAng + k * 6.2831853f / g_orbitN;
+        Vector3 pos(hp.x + cosf(a) * r, hp.y - 0.35f + 0.12f * sinf(a * 2.0f + (float)g_time), hp.z + sinf(a) * r);
+        Il2CppObject *t = G.compTransform[g_orbitItem[k].get()]();
+        G.trSetPosition[t](pos);
+        G.trSetRotation[t](rot);
+        Il2CppObject *rb = g_orbitRb[k].get();
+        if (Alive(rb)) {
+            if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);   // keep physics off if the game turns it back on
+            G.rbSetVelocity[rb](Vector3(0, 0, 0));
+        }
     }
 }
 
@@ -4070,7 +4250,8 @@ static void OverpoweredReset() {                               // room change: t
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
-    g_orbitItem.clear(); g_orbitRb.clear(); f_itemOrbit = false;
+    for (int k = 0; k < kOrbitMax; k++) { g_orbitItem[k].clear(); g_orbitRb[k].clear(); }
+    g_orbitN = 0; f_itemOrbit = false;
     try { DisableSongsReset(); } catch (...) {}
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
@@ -4113,7 +4294,8 @@ static void OnUpdate(float dt) {
         if (pgo) g_rigidbody.set(G.goGetComponent[pgo](G.tRigidbody));
     }
     if (!g_leftHand.get() || !g_rightHand.get() || !g_head.get()) return;
-    if (!g_built) BuildMenu();
+    if (g_rebuildMenu) RebuildMenuNow();
+    if (!g_built) { SetLayout(f_barkMode); BuildMenu(); }
 
     Buttons in = ReadButtons();
     ShowMenu(f_rightHand ? in.b : in.y);
