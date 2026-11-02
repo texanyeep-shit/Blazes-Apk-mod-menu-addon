@@ -468,6 +468,8 @@ static bool f_colorBlind = false;               // Settings: on-buttons say [ON]
 static bool f_barkMode = false;                 // Settings: the menu is a panel in front of you instead of on your hand
 static bool g_rebuildMenu = false;              // Bark Mode switched: build the menu again next frame
 static bool g_barkPlaced = false;               // the Bark Mode panel has been put in front of you for this opening
+static bool g_rebuiltNote = false;              // say how to open the menu once it's built again
+static bool g_barkOpen = false;                 // Bark Mode: the panel is open (a press opens it, another closes it)
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
@@ -710,7 +712,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
-    {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you."},
+    {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
@@ -764,7 +766,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
-    {"Bark Mode", "The menu opens as a big panel in front of you (like the bark menu) instead of on your hand."},
+    {"Bark Mode", "Press Y to open a big panel in front of you (like the bark menu); press again to close it."},
     {"Notifications", "Messages when you switch something."},
     {"Turn Everything Off", "Switches every mod off."},
 };
@@ -1188,10 +1190,14 @@ static void PlaceMenu() {
         f = f * (1.0f / n);
         Vector3 center = hp + f * 0.55f + Vector3(0, -0.18f, 0);
         Vector3 tilt = f + Vector3(0, -0.35f, 0);           // tipped back a little, toward your eyes
+        // Move the menu object itself and keep the panel at its center (local values only:
+        // the menu object is scaled down to nothing for the pop-open, and setting a world
+        // position under a zero scale sends the panel off to nowhere).
+        G.trSetLocalScale[t](Vector3(1, 1, 1));
         G.trSetPosition[t](center);
-        G.trSetRotation[t](Quaternion(0, 0, 0, 1));
-        G.trSetPosition[bt](center);
-        G.trSetRotation[bt](Quaternion::LookRotation(tilt));
+        G.trSetRotation[t](Quaternion::LookRotation(tilt));
+        G.trSetLocalPosition[bt](Vector3(0, 0, 0));
+        G.trSetLocalRotation[bt](Quaternion(0, 0, 0, 1));
         g_barkPlaced = true;
         return;
     }
@@ -1218,27 +1224,39 @@ static void PlaceMenu() {
 static void BarkModeToggled() { g_rebuildMenu = true; }
 static void RebuildMenuNow() {
     g_rebuildMenu = false;
+    g_rebuiltNote = true;
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText, &g_homeCube, &g_homeLabel}) r->clear();
     for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo}) Kill(*r);
     g_built = false; g_menuShown = false; g_touching = -2; g_hover = -2;
+    g_barkOpen = false;
     SetLayout(f_barkMode);
 }
 
 static void Press(Item *it) {
     switch (it->kind) {
+    // A button's own code is run inside a safety net: if it fails, that switch goes back off and
+    // you get a message, instead of the error stopping the whole menu.
     case OPEN:
         g_cat = it->target;
         g_page = 0;
-        if (it->target == SOUNDBOARD) ScanSongs();      // lists the songs in the sounds folder
+        if (it->target == SOUNDBOARD) { try { ScanSongs(); } catch (...) { ym::log("clientdabell: song scan error"); } }
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
-        if (it->fn) it->fn();
+        try { if (it->fn) it->fn(); }
+        catch (...) {
+            *it->flag = false;
+            try { if (it->fn) it->fn(); } catch (...) {}
+            ym::log("clientdabell: %s error, turned off", it->label);
+            Notify("%s had an error, turned off", it->label);
+            break;
+        }
         Notify("[%s] %s", *it->flag ? "ON" : "OFF", it->label);
         break;
     case ACTION:
-        if (it->fn) it->fn();
+        try { if (it->fn) it->fn(); }
+        catch (...) { ym::log("clientdabell: %s error", it->label); Notify("%s had an error", it->label); }
         break;
     }
     g_dirty = true;
@@ -1907,16 +1925,18 @@ static void QueueItems(const std::vector<PendingItem> &list) {
 // Item Rain: the game spawns items floating where they appear, so each rained item is found
 // once it exists (by its ID) and dropped: the game's own drop call, then gravity on and a
 // push down. The scene search runs 4 times a second, only while items are waiting.
-struct DropWatch { char id[8]; double until; bool orbit; };
+struct DropWatch { char id[8]; double until; bool orbit; Vector3 pos; };
 static void OrbitAdd(Il2CppObject *it);
+static bool OrbitHas(Il2CppObject *it);
 static std::vector<DropWatch> g_dropWatch;
 static double g_nextDropScan = 0;
-static void DropWatchAdd(const char *id, bool orbit = false) {
+static void DropWatchAdd(const char *id, bool orbit = false, Vector3 pos = Vector3(0, 0, 0)) {
     if (g_dropWatch.size() >= 64) return;
     DropWatch w{};
     snprintf(w.id, sizeof w.id, "%s", id);
-    w.until = g_time + 3.0;
+    w.until = g_time + 4.0;
     w.orbit = orbit;
+    w.pos = pos;
     g_dropWatch.push_back(w);
 }
 static void DropItem(Il2CppObject *it) {
@@ -1943,12 +1963,27 @@ static void DropWatchTick() {
     size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
     for (size_t i = 0; i < n && !g_dropWatch.empty(); i++) {
         Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
-        if (!Alive(it)) continue;
+        if (!Alive(it) || OrbitHas(it)) continue;
         auto *s = G.itemId[it]();
-        if (!s) continue;
-        std::string id = s->str();
+        std::string id = s ? s->str() : "";
+        // Matched by its ID; or, if the game gave it a different ID, by being the same kind of
+        // item sitting where one was just spawned (within 40 cm).
+        bool sameKind = false;
+        Vector3 ip;
+        bool havePos = false;
         for (size_t k = 0; k < g_dropWatch.size(); k++) {
-            if (id != g_dropWatch[k].id) continue;
+            bool match = !id.empty() && id == g_dropWatch[k].id;
+            if (!match) {
+                if (!havePos) {
+                    havePos = true;
+                    auto *ks = G.itemKey[it]();
+                    sameKind = ks && ks->str() == g_itemKey;
+                    ip = G.trGetPosition[G.compTransform[it]()]();
+                }
+                Vector3 d = ip - g_dropWatch[k].pos;
+                match = sameKind && d.x * d.x + d.y * d.y + d.z * d.z < 0.4f * 0.4f;
+            }
+            if (!match) continue;
             if (g_dropWatch[k].orbit) OrbitAdd(it);
             else DropItem(it);
             g_dropWatch.erase(g_dropWatch.begin() + k);
@@ -1963,7 +1998,7 @@ static void ItemQueueTick() {
         g_itemQueue.erase(g_itemQueue.begin());
         char id[8] = {};
         bool ok = SendItem(g_itemKey, p.pos, Quaternion(0, 0, 0, 1), p.vel, id);
-        if (ok && (p.drop || p.orbit)) DropWatchAdd(id, p.orbit);
+        if (ok && (p.drop || p.orbit)) DropWatchAdd(id, p.orbit, p.pos);
         static int logged = 0;
         if (logged++ < 3) ym::log("clientdabell: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
         if (!ok) { g_itemQueue.clear(); Notify("Item spawning isn't ready in this room"); }
@@ -2097,6 +2132,10 @@ static void OrbitAdd(Il2CppObject *it) {
     }
     g_orbitAdded[k] = g_time;
 }
+static bool OrbitHas(Il2CppObject *it) {
+    for (int k = 0; k < g_orbitN; k++) if (g_orbitItem[k].get() == it) return true;
+    return false;
+}
 static float OrbitRadius() { return std::max(1.0f, g_orbitN * 0.35f / 6.2831853f); }   // about 0.35 m between items
 static void ItemOrbitToggled() {
     if (!f_itemOrbit) { OrbitRelease(); Notify("Item Orbit off"); return; }
@@ -2124,14 +2163,17 @@ static void ItemOrbitTick(float dt) {
     if (!f_itemOrbit) { if (g_orbitN) OrbitRelease(); return; }   // switched off some other way
     Il2CppObject *head = g_head.get();
     if (!head) { f_itemOrbit = false; g_dirty = true; OrbitRelease(); return; }
-    for (int k = g_orbitN - 1; k >= 0; k--) {           // gone, or grabbed (after a moment to leave the hand): out of the orbit
+    // They keep spinning until you switch Item Orbit off. An item that's gone (despawned) is
+    // taken out; one the game still counts as held is let go again (once a second).
+    static double nextLetGo = 0;
+    bool letGo = g_time >= nextLetGo;
+    if (letGo) nextLetGo = g_time + 1.0;
+    for (int k = g_orbitN - 1; k >= 0; k--) {
         Il2CppObject *it = g_orbitItem[k].get();
         if (!Alive(it)) { OrbitReleaseOne(k); continue; }
-        if (g_time - g_orbitAdded[k] > 1.0 && G.itemHeld.IsValid() && G.itemHeld[it]()) OrbitReleaseOne(k);
+        if (letGo && G.itemHeld.IsValid() && G.itemHeld[it]()) { try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {} }
     }
-    bool waiting = false;
-    for (auto &w : g_dropWatch) waiting |= w.orbit && g_time <= w.until;
-    if (g_orbitN == 0 && !waiting) { f_itemOrbit = false; g_dirty = true; Notify("Item Orbit off"); return; }
+    if (g_orbitN == 0) return;                          // nothing to spin right now (stays on until you switch it off)
     g_orbitAng += 1.6f * dt;                             // about one lap every 4 seconds
     if (g_orbitAng > 6.2831853f) g_orbitAng -= 6.2831853f;
     Vector3 hp = G.trGetPosition[head]();
@@ -4295,16 +4337,39 @@ static void OnUpdate(float dt) {
     }
     if (!g_leftHand.get() || !g_rightHand.get() || !g_head.get()) return;
     if (g_rebuildMenu) RebuildMenuNow();
-    if (!g_built) { SetLayout(f_barkMode); BuildMenu(); }
+    if (!g_built) {
+        SetLayout(f_barkMode);
+        BuildMenu();
+        if (g_rebuiltNote && g_built) {
+            g_rebuiltNote = false;
+            Notify(f_barkMode ? "Bark Mode on: press %s to open or close the menu" : "Bark Mode off: the menu is back on your hand", f_rightHand ? "B" : "Y");
+        }
+    }
 
     Buttons in = ReadButtons();
-    ShowMenu(f_rightHand ? in.b : in.y);
+    {
+        bool btn = f_rightHand ? in.b : in.y;
+        if (g_barkLayout) {                              // Bark Mode: a press opens the panel and it stays up; press again to close
+            static bool prevBtn = false;
+            if (btn && !prevBtn) g_barkOpen = !g_barkOpen;
+            prevBtn = btn;
+            ShowMenu(g_barkOpen);
+        } else {
+            g_barkOpen = false;
+            ShowMenu(btn);                               // hand menu: shown while you hold the button
+        }
+    }
     if (g_menuShown) {
-        PlaceMenu();
-        CheckPress();
-        if (g_dirty) RenderPage();
-        UpdateTitle();
-        AnimateMenu();
+        try {
+            PlaceMenu();
+            CheckPress();
+            if (g_dirty) RenderPage();
+            UpdateTitle();
+            AnimateMenu();
+        } catch (...) {                                  // never let one bad frame stop the menu
+            g_dirty = true;
+            ym::log("clientdabell: menu error (kept going)");
+        }
     }
     if (g_notifyUntil > 0 && g_time >= g_notifyUntil) { Show(g_notifyGo, false); g_notifyUntil = 0; }
     FlyTick(in, dt);
