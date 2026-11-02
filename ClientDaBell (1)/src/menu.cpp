@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v.1.2.7"
+#define CDB_VERSION "v.1.2.8"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -528,8 +528,8 @@ static void OverpoweredOff();
 static void NextWeatherIntensity();
 static void TodPicked();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, SPAWNER, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers", "Item Spawner"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -594,6 +594,7 @@ static Item g_items[] = {
     {RIG, "Beyblade", TOGGLE, MAIN, &g_danceSel[7], DancePicked},
 
     {ITEMS, "Exit Items", OPEN, MAIN},
+    {ITEMS, "Item Spawner", OPEN, SPAWNER},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
@@ -667,6 +668,12 @@ static Item g_items[] = {
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
 static void DisableAllMods();
+// Item Spawner: a list built from the game's own items (every item kind it has loaded).
+static std::vector<std::string> g_catalog;              // item kinds (their keys), sorted
+static std::vector<Item> g_spawnView;                    // one button per kind (labels point into g_catalog)
+static void SpawnPicked();
+static Item g_spawnExit = {SPAWNER, "Exit Item Spawner", OPEN, ITEMS};
+static Item *g_lastPressed = nullptr;                   // the button being pressed right now (for SpawnPicked)
 static bool f_modsPaused = false;               // Enabled Mods -> Disable All Mods is on: the mods that were on are saved here
 static std::vector<Item *> g_pausedMods;
 static Item g_disableAllItem = {ENABLED, "Disable All Mods", TOGGLE, MAIN, &f_modsPaused, DisableAllMods};
@@ -712,7 +719,8 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
-    {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you."},
+    {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
+    {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
@@ -869,7 +877,10 @@ static void DisableAllMods() {
 
 static void BuildView() {
     g_view.clear();
-    if (g_cat == ENABLED) {
+    if (g_cat == SPAWNER) {
+        g_view.push_back(&g_spawnExit);
+        for (auto &it : g_spawnView) g_view.push_back(&it);
+    } else if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
         bool any = f_modsPaused;                          // the switch stays while mods are saved
         for (auto &it : g_items) any |= ListedAsMod(it);
@@ -1233,20 +1244,33 @@ static void RebuildMenuNow() {
     SetLayout(f_barkMode);
 }
 
+static void ScanCatalog();
 static void Press(Item *it) {
+    g_lastPressed = it;
     switch (it->kind) {
+    // A button's own code is run inside a safety net: if it fails, that switch goes back off and
+    // you get a message, instead of the error stopping the whole menu.
     case OPEN:
         g_cat = it->target;
         g_page = 0;
-        if (it->target == SOUNDBOARD) ScanSongs();      // lists the songs in the sounds folder
+        if (it->target == SOUNDBOARD) { try { ScanSongs(); } catch (...) { ym::log("clientdabell: song scan error"); } }
+        if (it->target == SPAWNER) { try { ScanCatalog(); } catch (...) { ym::log("clientdabell: item list error"); } }
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
-        if (it->fn) it->fn();
+        try { if (it->fn) it->fn(); }
+        catch (...) {
+            *it->flag = false;
+            try { if (it->fn) it->fn(); } catch (...) {}
+            ym::log("clientdabell: %s error, turned off", it->label);
+            Notify("%s had an error, turned off", it->label);
+            break;
+        }
         Notify("[%s] %s", *it->flag ? "ON" : "OFF", it->label);
         break;
     case ACTION:
-        if (it->fn) it->fn();
+        try { if (it->fn) it->fn(); }
+        catch (...) { ym::log("clientdabell: %s error", it->label); Notify("%s had an error", it->label); }
         break;
     }
     g_dirty = true;
@@ -1915,16 +1939,18 @@ static void QueueItems(const std::vector<PendingItem> &list) {
 // Item Rain: the game spawns items floating where they appear, so each rained item is found
 // once it exists (by its ID) and dropped: the game's own drop call, then gravity on and a
 // push down. The scene search runs 4 times a second, only while items are waiting.
-struct DropWatch { char id[8]; double until; bool orbit; };
+struct DropWatch { char id[8]; double until; bool orbit; Vector3 pos; };
 static void OrbitAdd(Il2CppObject *it);
+static bool OrbitHas(Il2CppObject *it);
 static std::vector<DropWatch> g_dropWatch;
 static double g_nextDropScan = 0;
-static void DropWatchAdd(const char *id, bool orbit = false) {
+static void DropWatchAdd(const char *id, bool orbit = false, Vector3 pos = Vector3(0, 0, 0)) {
     if (g_dropWatch.size() >= 64) return;
     DropWatch w{};
     snprintf(w.id, sizeof w.id, "%s", id);
-    w.until = g_time + 3.0;
+    w.until = g_time + 4.0;
     w.orbit = orbit;
+    w.pos = pos;
     g_dropWatch.push_back(w);
 }
 static void DropItem(Il2CppObject *it) {
@@ -1951,12 +1977,27 @@ static void DropWatchTick() {
     size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
     for (size_t i = 0; i < n && !g_dropWatch.empty(); i++) {
         Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
-        if (!Alive(it)) continue;
+        if (!Alive(it) || OrbitHas(it)) continue;
         auto *s = G.itemId[it]();
-        if (!s) continue;
-        std::string id = s->str();
+        std::string id = s ? s->str() : "";
+        // Matched by its ID; or, if the game gave it a different ID, by being the same kind of
+        // item sitting where one was just spawned (within 40 cm).
+        bool sameKind = false;
+        Vector3 ip;
+        bool havePos = false;
         for (size_t k = 0; k < g_dropWatch.size(); k++) {
-            if (id != g_dropWatch[k].id) continue;
+            bool match = !id.empty() && id == g_dropWatch[k].id;
+            if (!match) {
+                if (!havePos) {
+                    havePos = true;
+                    auto *ks = G.itemKey[it]();
+                    sameKind = ks && ks->str() == g_itemKey;
+                    ip = G.trGetPosition[G.compTransform[it]()]();
+                }
+                Vector3 d = ip - g_dropWatch[k].pos;
+                match = sameKind && d.x * d.x + d.y * d.y + d.z * d.z < 0.4f * 0.4f;
+            }
+            if (!match) continue;
             if (g_dropWatch[k].orbit) OrbitAdd(it);
             else DropItem(it);
             g_dropWatch.erase(g_dropWatch.begin() + k);
@@ -1971,7 +2012,7 @@ static void ItemQueueTick() {
         g_itemQueue.erase(g_itemQueue.begin());
         char id[8] = {};
         bool ok = SendItem(g_itemKey, p.pos, Quaternion(0, 0, 0, 1), p.vel, id);
-        if (ok && (p.drop || p.orbit)) DropWatchAdd(id, p.orbit);
+        if (ok && (p.drop || p.orbit)) DropWatchAdd(id, p.orbit, p.pos);
         static int logged = 0;
         if (logged++ < 3) ym::log("clientdabell: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
         if (!ok) { g_itemQueue.clear(); Notify("Item spawning isn't ready in this room"); }
@@ -2077,7 +2118,20 @@ static Il2CppObject *ItemRigidbody(Il2CppObject *it) {
     }
     return Alive(rb) ? rb : nullptr;
 }
+// Collision off while an item orbits (so dragging it through walls, the floor and you doesn't
+// make the game push it around), back on when it's let go.
+static void ItemCollision(Il2CppObject *it, bool on) {
+    Il2CppObject *go = Alive(it) ? G.compGameObject[it]() : nullptr;
+    if (!go || !G.tCollider || !G.colliderSetEnabled.IsValid() || !G.getComponentsInChildren.IsValid()) return;
+    auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tCollider, true);
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n && i < 16; i++) {
+        Il2CppObject *c = ((Il2CppObject **)(arr + 0x20))[i];
+        if (Alive(c)) G.colliderSetEnabled[c](on);
+    }
+}
 static void OrbitReleaseOne(int k) {                    // give item k its physics back and take it out
+    try { ItemCollision(g_orbitItem[k].get(), true); } catch (...) {}
     Il2CppObject *rb = g_orbitRb[k].get();
     if (Alive(rb)) {
         if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](false);
@@ -2102,8 +2156,14 @@ static void OrbitAdd(Il2CppObject *it) {
     if (rb) {
         g_orbitRb[k].set(rb);
         if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);   // we move it, not physics
+        G.rbSetVelocity[rb](Vector3(0, 0, 0));
     }
+    try { ItemCollision(it, false); } catch (...) {}
     g_orbitAdded[k] = g_time;
+}
+static bool OrbitHas(Il2CppObject *it) {
+    for (int k = 0; k < g_orbitN; k++) if (g_orbitItem[k].get() == it) return true;
+    return false;
 }
 static float OrbitRadius() { return std::max(1.0f, g_orbitN * 0.35f / 6.2831853f); }   // about 0.35 m between items
 static void ItemOrbitToggled() {
@@ -2132,14 +2192,11 @@ static void ItemOrbitTick(float dt) {
     if (!f_itemOrbit) { if (g_orbitN) OrbitRelease(); return; }   // switched off some other way
     Il2CppObject *head = g_head.get();
     if (!head) { f_itemOrbit = false; g_dirty = true; OrbitRelease(); return; }
-    for (int k = g_orbitN - 1; k >= 0; k--) {           // gone, or grabbed (after a moment to leave the hand): out of the orbit
-        Il2CppObject *it = g_orbitItem[k].get();
-        if (!Alive(it)) { OrbitReleaseOne(k); continue; }
-        if (g_time - g_orbitAdded[k] > 1.0 && G.itemHeld.IsValid() && G.itemHeld[it]()) OrbitReleaseOne(k);
-    }
-    bool waiting = false;
-    for (auto &w : g_dropWatch) waiting |= w.orbit && g_time <= w.until;
-    if (g_orbitN == 0 && !waiting) { f_itemOrbit = false; g_dirty = true; Notify("Item Orbit off"); return; }
+    // They keep spinning until you switch Item Orbit off. An item that's gone (despawned) is
+    // taken out. Nothing is sent to the room while they spin (only the one "let go" at the start).
+    for (int k = g_orbitN - 1; k >= 0; k--)
+        if (!Alive(g_orbitItem[k].get())) OrbitReleaseOne(k);
+    if (g_orbitN == 0) return;                          // nothing to spin right now (stays on until you switch it off)
     g_orbitAng += 1.6f * dt;                             // about one lap every 4 seconds
     if (g_orbitAng > 6.2831853f) g_orbitAng -= 6.2831853f;
     Vector3 hp = G.trGetPosition[head]();
@@ -2151,16 +2208,59 @@ static void ItemOrbitTick(float dt) {
         Il2CppObject *t = G.compTransform[g_orbitItem[k].get()]();
         G.trSetPosition[t](pos);
         G.trSetRotation[t](rot);
-        Il2CppObject *rb = g_orbitRb[k].get();
-        if (Alive(rb)) {
-            if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);   // keep physics off if the game turns it back on
-            G.rbSetVelocity[rb](Vector3(0, 0, 0));
+    }
+    static double nextRecheck = 0;                       // twice a second: keep physics paused if the game turned it back on
+    if (g_time >= nextRecheck) {
+        nextRecheck = g_time + 0.5;
+        for (int k = 0; k < g_orbitN; k++) {
+            Il2CppObject *rb = g_orbitRb[k].get();
+            if (Alive(rb) && G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);
         }
     }
 }
 
 // Spawn On Hand: each right-trigger press (grip open) spawns the item at your hand.
 static bool g_onHandTrigger = false;
+// Item Spawner: every Item the game has loaded (Resources.FindObjectsOfTypeAll also finds the
+// item prefabs that aren't in the room), one entry per item kind. Built when the page opens.
+static void ScanCatalog() {
+    if (!G.tItem || !G.itemKey.IsValid() || !G.findAll.IsValid()) { Notify("Item list isn't available in this game"); return; }
+    std::vector<std::string> keys;
+    auto *arr = (uint8_t *)G.findAll((Il2CppObject *)G.tItem);
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(it)) continue;
+        auto *k = G.itemKey[it]();
+        std::string key = k ? k->str() : "";
+        if (!key.empty() && key.size() < 60) keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    if (keys.size() > 400) keys.resize(400);
+    g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
+    g_catalog = std::move(keys);
+    g_spawnView.reserve(g_catalog.size());
+    for (auto &k : g_catalog) g_spawnView.push_back({SPAWNER, k.c_str(), ACTION, MAIN, nullptr, SpawnPicked});
+    g_page = 0;
+    ym::log("clientdabell: item spawner found %d item kinds", (int)g_catalog.size());
+    Notify(g_catalog.empty() ? "No items found" : "%d items", (int)g_catalog.size());
+}
+// Tapping an item in the list: one of it appears 80 cm in front of you. Same limits as
+// Spawn On Hand: one every 0.3 s, through the item queue (2 sent per frame, 32 waiting at most).
+static void SpawnPicked() {
+    Item *it = g_lastPressed;
+    Il2CppObject *head = g_head.get();
+    if (!it || !head || g_spawnView.empty() || it < &g_spawnView[0] || it > &g_spawnView.back()) return;
+    if (g_time < g_nextItem) return;
+    if (g_itemQueue.size() >= 32) { Notify("Wait a moment"); return; }
+    g_nextItem = g_time + 0.3;
+    snprintf(g_itemKey, sizeof g_itemKey, "%s", g_catalog[it - &g_spawnView[0]].c_str());
+    Vector3 f = G.trGetForward[head]();
+    g_itemQueue.push_back({G.trGetPosition[head]() + f * 0.8f + Vector3(0, -0.2f, 0), Vector3(0, 0, 0)});
+    Notify("Spawned %.40s", g_itemKey);
+}
+
 static void SpawnOnHandTick(const Buttons &in) {
     bool press = in.rtrig && !g_onHandTrigger;
     g_onHandTrigger = in.rtrig;
@@ -4326,11 +4426,16 @@ static void OnUpdate(float dt) {
         }
     }
     if (g_menuShown) {
-        PlaceMenu();
-        CheckPress();
-        if (g_dirty) RenderPage();
-        UpdateTitle();
-        AnimateMenu();
+        try {
+            PlaceMenu();
+            CheckPress();
+            if (g_dirty) RenderPage();
+            UpdateTitle();
+            AnimateMenu();
+        } catch (...) {                                  // never let one bad frame stop the menu
+            g_dirty = true;
+            ym::log("clientdabell: menu error (kept going)");
+        }
     }
     if (g_notifyUntil > 0 && g_time >= g_notifyUntil) { Show(g_notifyGo, false); g_notifyUntil = 0; }
     FlyTick(in, dt);
