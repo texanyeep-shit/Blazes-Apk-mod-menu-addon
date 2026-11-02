@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v.1.2.5 Patch #3"
+#define CDB_VERSION "v.1.2.6"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -111,7 +111,7 @@ static struct {
     BNM::MonoType *tPhotonView = nullptr, *tItem = nullptr;
     Method<BNM::Structures::Mono::String *> itemKey, itemId;
     Method<bool> itemHeld;
-    Method<void> itemDrop, setHeldItem;
+    Method<void> itemDrop, setHeldItem, rbSetKinematic;
     void *(*arrayNew)(void *, uintptr_t) = nullptr;
     void *(*valueBox)(void *, void *) = nullptr;
     Method<bool> behaviourGetEnabled;
@@ -222,6 +222,7 @@ static bool Lookups() {
     G.trTransformPoint = Overload(tr, "TransformPoint", {"UnityEngine.Vector3"});
     G.rbSetVelocity = rb.GetMethod("set_velocity", 1);
     G.rbGetVelocity = rb.GetMethod("get_velocity", 0);
+    G.rbSetKinematic = rb.GetMethod("set_isKinematic", 1);
     G.rendererGetMaterial = rend.GetMethod("get_material", 0);
     G.matSetColor = Overload(mat, "set_color", {"UnityEngine.Color"});
     G.matSetShader = mat.GetMethod("set_shader", 1);
@@ -440,13 +441,13 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash, f_blockRain;
+static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash;
 static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_overlap = false;                  // Play while a song plays mixes the two together
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
-struct PendingItem { Vector3 pos, vel; };
+struct PendingItem { Vector3 pos, vel; bool drop = false; };   // drop: make it fall once it appears (Item Rain)
 static std::vector<PendingItem> g_itemQueue;
 static double g_nextItem = 0, g_nextBatch = 0;
 static int g_dupeArmed = 0;
@@ -569,7 +570,6 @@ static Item g_items[] = {
     {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
     {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
     {ITEMS, "Item Rain", ACTION, MAIN, nullptr, ItemRain},
-    {ITEMS, "Block Rain", TOGGLE, MAIN, &f_blockRain},
 
     {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
     {SOUNDBOARD, g_soundLabel, ACTION, MAIN, nullptr, PlaySong},
@@ -667,7 +667,6 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
-    {"Block Rain", "Colorful blocks fall from the sky around you and pile up. Only you see them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
     {"Helicopter", "Both arms spin around you. Hold left trigger."},
@@ -1759,11 +1758,63 @@ static void QueueItems(const std::vector<PendingItem> &list) {
     for (auto &p : list) if (g_itemQueue.size() < 32) g_itemQueue.push_back(p);
 }
 
+// Item Rain: the game spawns items floating where they appear, so each rained item is found
+// once it exists (by its ID) and dropped: the game's own drop call, then gravity on and a
+// push down. The scene search runs 4 times a second, only while items are waiting.
+struct DropWatch { char id[8]; double until; };
+static std::vector<DropWatch> g_dropWatch;
+static double g_nextDropScan = 0;
+static void DropWatchAdd(const char *id) {
+    if (g_dropWatch.size() >= 64) return;
+    DropWatch w{};
+    snprintf(w.id, sizeof w.id, "%s", id);
+    w.until = g_time + 3.0;
+    g_dropWatch.push_back(w);
+}
+static void DropItem(Il2CppObject *it) {
+    try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}
+    Il2CppObject *go = G.compGameObject[it]();
+    Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go](G.tRigidbody) : nullptr;
+    if (!rb && go && G.getComponentsInChildren.IsValid()) {
+        auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tRigidbody, true);
+        if (arr && *(uintptr_t *)(arr + 0x18) > 0) rb = ((Il2CppObject **)(arr + 0x20))[0];
+    }
+    if (!Alive(rb)) return;
+    if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](false);
+    if (G.rbSetUseGravity.IsValid()) G.rbSetUseGravity[rb](true);
+    G.rbSetVelocity[rb](Vector3(0, -1.5f, 0));
+}
+static void DropWatchTick() {
+    if (g_dropWatch.empty() || g_time < g_nextDropScan) return;
+    g_nextDropScan = g_time + 0.25;
+    g_dropWatch.erase(std::remove_if(g_dropWatch.begin(), g_dropWatch.end(), [](const DropWatch &w) { return g_time > w.until; }),
+                      g_dropWatch.end());
+    if (g_dropWatch.empty() || !G.tItem || !G.itemId.IsValid() || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return;
+    auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem)
+                                                  : G.findSceneByType((Il2CppObject *)G.tItem, 0));
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n && !g_dropWatch.empty(); i++) {
+        Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(it)) continue;
+        auto *s = G.itemId[it]();
+        if (!s) continue;
+        std::string id = s->str();
+        for (size_t k = 0; k < g_dropWatch.size(); k++) {
+            if (id != g_dropWatch[k].id) continue;
+            DropItem(it);
+            g_dropWatch.erase(g_dropWatch.begin() + k);
+            break;
+        }
+    }
+}
 static void ItemQueueTick() {
+    DropWatchTick();
     for (int sent = 0; sent < 2 && !g_itemQueue.empty(); sent++) {   // 2 a frame at most
         PendingItem p = g_itemQueue.front();
         g_itemQueue.erase(g_itemQueue.begin());
-        bool ok = SendItem(g_itemKey, p.pos, Quaternion(0, 0, 0, 1), p.vel);
+        char id[8] = {};
+        bool ok = SendItem(g_itemKey, p.pos, Quaternion(0, 0, 0, 1), p.vel, id);
+        if (ok && p.drop) DropWatchAdd(id);
         static int logged = 0;
         if (logged++ < 3) ym::log("clientdabell: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
         if (!ok) { g_itemQueue.clear(); Notify("Item spawning isn't ready in this room"); }
@@ -1821,7 +1872,7 @@ static void ItemRain() {
     std::vector<PendingItem> list;
     for (int i = 0; i < 32; i++) {
         float a = Rand01() * 6.2831853f, r = 0.5f + 4.5f * sqrtf(Rand01());
-        list.push_back({Vector3(hp.x + cosf(a) * r, hp.y + 5.0f + Rand01() * 4.0f, hp.z + sinf(a) * r), Vector3(0, -1.0f, 0)});
+        list.push_back({Vector3(hp.x + cosf(a) * r, hp.y + 5.0f + Rand01() * 4.0f, hp.z + sinf(a) * r), Vector3(0, -1.0f, 0), true});
     }
     double before = g_nextBatch;
     QueueItems(list);
@@ -3764,65 +3815,9 @@ static void OverpoweredReset() {                               // room change: t
     for (auto &r : g_ring) Kill(r);
 }
 
-// ---- Block Rain (Items page; only on your own game) ----------------------------------
-// Colorful cubes with physics fall from the sky around you, bounce and pile up. They are
-// plain local objects, not game items, so nothing is sent and only you see them. Hard limit
-// of kRainMax cubes: when the limit is reached the oldest one is picked up and dropped again
-// from the sky instead of making a new one. Turning it off removes them all.
-static constexpr int kRainMax = 40;
-static Ref g_rain[kRainMax], g_rainRb[kRainMax];
-static int g_rainMade = 0, g_rainNext = 0;
-static double g_rainAt = 0;
-static bool g_rainOn = false;
-
-static void RainClear() {
-    for (int i = 0; i < kRainMax; i++) { Kill(g_rain[i]); g_rainRb[i].clear(); }
-    g_rainMade = g_rainNext = 0;
-    g_rainAt = 0;
-    g_rainOn = false;
-}
-static void RainDrop(int i, Vector3 hp) {
-    Il2CppObject *o = g_rain[i].get();
-    if (!Alive(o)) return;
-    float a = Rand01() * 6.2831853f, r = 1.0f + 6.0f * sqrtf(Rand01()), size = 0.2f + Rand01() * 0.25f;
-    Il2CppObject *t = Tr(o);
-    G.trSetPosition[t](Vector3(hp.x + cosf(a) * r, hp.y + 7.0f + Rand01() * 4.0f, hp.z + sinf(a) * r));
-    float ang = Rand01() * 6.2831853f;
-    Vector3 ax(Rand01() - 0.5f, Rand01() - 0.5f, Rand01() - 0.5f);
-    float n = sqrtf(ax.x * ax.x + ax.y * ax.y + ax.z * ax.z);
-    if (n < 0.01f) { ax = Vector3(0, 1, 0); n = 1; }
-    float s2 = sinf(ang * 0.5f) / n;
-    G.trSetRotation[t](Quaternion(ax.x * s2, ax.y * s2, ax.z * s2, cosf(ang * 0.5f)));
-    G.trSetLocalScale[t](Vector3(size, size, size));
-    SetColor(o, Rainbow(Rand01()));
-    if (Il2CppObject *rb = g_rainRb[i].get()) G.rbSetVelocity[rb](Vector3(0, -2.0f, 0));
-}
-static void BlockRainTick() {
-    Il2CppObject *head = g_head.get();
-    if (!f_blockRain || !head) { if (g_rainOn) RainClear(); return; }
-    if (!g_rainOn) { g_rainOn = true; Notify("Block Rain on"); }
-    if (g_time < g_rainAt) return;
-    g_rainAt = g_time + 0.18;                            // about 5 blocks a second
-    Vector3 hp = G.trGetPosition[head]();
-    int i;
-    if (g_rainMade < kRainMax) {                         // make a new one (one at a time, never more than kRainMax)
-        Il2CppObject *o = Cube(Color(1, 1, 1, 1), true);
-        if (!o) return;
-        Il2CppObject *rb = G.tRigidbody ? G.goAddComponent[o](G.tRigidbody) : nullptr;
-        i = g_rainMade++;
-        g_rain[i].set(o);
-        if (rb) g_rainRb[i].set(rb);
-    } else {                                             // full: reuse the oldest
-        i = g_rainNext;
-        g_rainNext = (g_rainNext + 1) % kRainMax;
-    }
-    RainDrop(i, hp);
-}
-
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
-    RainClear();
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
@@ -3889,8 +3884,6 @@ static void OnUpdate(float dt) {
     ApplyGravity();
     NoclipTick(in);
     TeleportGunTick(in);
-    try { BlockRainTick(); }
-    catch (...) { f_blockRain = false; try { RainClear(); } catch (...) {} ym::log("clientdabell: block rain error, turned off"); }
     try { SpawnOnHandTick(in); ItemQueueTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
     try { LoadTick(); SoundTick(); }
