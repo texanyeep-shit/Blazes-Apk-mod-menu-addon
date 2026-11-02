@@ -1985,6 +1985,7 @@ static void LogRecorder(const char *what, Il2CppObject *r) {
             G.recGetSending.IsValid() ? (int)G.recGetSending[r]() : -1,
             G.recGetSource.IsValid() ? G.recGetSource[r]() : -1);
 }
+static int g_recCount = -1;                    // how many voice recorders the last search found
 static Il2CppObject *FindRecorder() {
     Il2CppObject *r = g_recorder.get();
     if (Alive(r)) return r;
@@ -2001,6 +2002,7 @@ static Il2CppObject *FindRecorder() {
                                                       : G.findSceneByType((Il2CppObject *)G.tRecorder, 0));
         uintptr_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
         auto **el = arr ? (Il2CppObject **)(arr + 0x20) : nullptr;
+        g_recCount = (int)n;
         for (uintptr_t i = 0; i < n && i < 32; i++) {
             int sc = RecorderScore(el[i]);
             if (sc > best) { best = sc; r = el[i]; }
@@ -2144,7 +2146,11 @@ static void SoundTick() {
     if (g_micTries >= 5 && MicSettingsOk(r)) {         // set up right, but no sign of sound going out: keep it, say so
         ym::log("clientdabell: voice set to the song but not confirmed sending");
         LogRecorder("recorder after the song was sent", r);
-        Notify("Sent to voice chat, couldn't confirm the room hears it");
+        // On-screen details (the headset has no easy log): recorders found, connected, sending, source
+        Notify("Not confirmed. rec=%d init=%d send=%d src=%d", g_recCount,
+               G.recGetInit.IsValid() ? (int)G.recGetInit[r]() : -1,
+               G.recGetSending.IsValid() ? (int)G.recGetSending[r]() : -1,
+               G.recGetSource.IsValid() ? G.recGetSource[r]() : -1);
         g_micCheckAt = 0;
         return;
     }
