@@ -468,6 +468,8 @@ static bool f_colorBlind = false;               // Settings: on-buttons say [ON]
 static bool f_barkMode = false;                 // Settings: the menu is a panel in front of you instead of on your hand
 static bool g_rebuildMenu = false;              // Bark Mode switched: build the menu again next frame
 static bool g_barkPlaced = false;               // the Bark Mode panel has been put in front of you for this opening
+static bool g_rebuiltNote = false;              // say how to open the menu once it's built again
+static bool g_barkOpen = false;                 // Bark Mode: the panel is open (a press opens it, another closes it)
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
@@ -764,7 +766,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
-    {"Bark Mode", "The menu opens as a big panel in front of you (like the bark menu) instead of on your hand."},
+    {"Bark Mode", "Press Y to open a big panel in front of you (like the bark menu); press again to close it."},
     {"Notifications", "Messages when you switch something."},
     {"Turn Everything Off", "Switches every mod off."},
 };
@@ -1188,10 +1190,14 @@ static void PlaceMenu() {
         f = f * (1.0f / n);
         Vector3 center = hp + f * 0.55f + Vector3(0, -0.18f, 0);
         Vector3 tilt = f + Vector3(0, -0.35f, 0);           // tipped back a little, toward your eyes
+        // Move the menu object itself and keep the panel at its center (local values only:
+        // the menu object is scaled down to nothing for the pop-open, and setting a world
+        // position under a zero scale sends the panel off to nowhere).
+        G.trSetLocalScale[t](Vector3(1, 1, 1));
         G.trSetPosition[t](center);
-        G.trSetRotation[t](Quaternion(0, 0, 0, 1));
-        G.trSetPosition[bt](center);
-        G.trSetRotation[bt](Quaternion::LookRotation(tilt));
+        G.trSetRotation[t](Quaternion::LookRotation(tilt));
+        G.trSetLocalPosition[bt](Vector3(0, 0, 0));
+        G.trSetLocalRotation[bt](Quaternion(0, 0, 0, 1));
         g_barkPlaced = true;
         return;
     }
@@ -1218,10 +1224,12 @@ static void PlaceMenu() {
 static void BarkModeToggled() { g_rebuildMenu = true; }
 static void RebuildMenuNow() {
     g_rebuildMenu = false;
+    g_rebuiltNote = true;
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText, &g_homeCube, &g_homeLabel}) r->clear();
     for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo}) Kill(*r);
     g_built = false; g_menuShown = false; g_touching = -2; g_hover = -2;
+    g_barkOpen = false;
     SetLayout(f_barkMode);
 }
 
@@ -4295,10 +4303,28 @@ static void OnUpdate(float dt) {
     }
     if (!g_leftHand.get() || !g_rightHand.get() || !g_head.get()) return;
     if (g_rebuildMenu) RebuildMenuNow();
-    if (!g_built) { SetLayout(f_barkMode); BuildMenu(); }
+    if (!g_built) {
+        SetLayout(f_barkMode);
+        BuildMenu();
+        if (g_rebuiltNote && g_built) {
+            g_rebuiltNote = false;
+            Notify(f_barkMode ? "Bark Mode on: press %s to open or close the menu" : "Bark Mode off: the menu is back on your hand", f_rightHand ? "B" : "Y");
+        }
+    }
 
     Buttons in = ReadButtons();
-    ShowMenu(f_rightHand ? in.b : in.y);
+    {
+        bool btn = f_rightHand ? in.b : in.y;
+        if (g_barkLayout) {                              // Bark Mode: a press opens the panel and it stays up; press again to close
+            static bool prevBtn = false;
+            if (btn && !prevBtn) g_barkOpen = !g_barkOpen;
+            prevBtn = btn;
+            ShowMenu(g_barkOpen);
+        } else {
+            g_barkOpen = false;
+            ShowMenu(btn);                               // hand menu: shown while you hold the button
+        }
+    }
     if (g_menuShown) {
         PlaceMenu();
         CheckPress();
