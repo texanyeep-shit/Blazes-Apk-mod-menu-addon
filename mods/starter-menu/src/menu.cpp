@@ -2543,6 +2543,132 @@ static int ReadNetLists() {
     return added;
 }
 
+// Lists of names kept by the game's loaded parts (item database, building store, block
+// manager and the like). Only parts that already exist in the game are read, and only their
+// own (non-static) fields, so nothing gets started up. Only lists of text are read, every entry
+// is checked to really be text, and a list is only used if it holds an item name already
+// confirmed real (like one you held or spawned).
+static int g_classListsUsed = 0;
+static std::string g_listFrom;
+static int ReadLoadedLists() {
+    Refl &r = Reflection();
+    auto Rs = ym::api()->resolve;
+    auto getImage = (void *(*)(void *))Rs("il2cpp_class_get_image");
+    auto count = (size_t (*)(const void *))Rs("il2cpp_image_get_class_count");
+    auto getClass = (void *(*)(const void *, size_t))Rs("il2cpp_image_get_class");
+    auto typeName = (char *(*)(const void *))Rs("il2cpp_type_get_name");
+    auto freeMem = (void (*)(void *))Rs("il2cpp_free");
+    auto isGeneric = (bool (*)(void *))Rs("il2cpp_class_is_generic");
+    auto elemSize = (int (*)(void *))Rs("il2cpp_class_array_element_size");
+    Class uobj("UnityEngine", "Object");
+    void *strK = Class("System", "String").GetClass();
+    void *itemK = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
+    g_classListsUsed = 0;
+    g_listFrom.clear();
+    if (!r.ok || !getImage || !count || !getClass || !typeName || !elemSize || !uobj.IsValid() || !strK || !itemK ||
+        !G.findAll.IsValid())
+        return 0;
+    std::vector<std::string> confirmed = g_seenKeys;
+    if (confirmed.empty()) return 0;
+    std::sort(confirmed.begin(), confirmed.end());
+    void *uobjClass = uobj.GetClass();
+    auto FieldOff = [&](Il2CppObject *o, std::initializer_list<const char *> names) {
+        for (void *c = o->klass; c; c = r.getParent(c)) {
+            void *iter = nullptr;
+            while (void *f = r.getFields(c, &iter)) {
+                const char *fn = r.fieldName(f);
+                if (!fn) continue;
+                for (const char *want : names) if (!strcmp(fn, want)) return (int)r.fieldOffset(f);
+            }
+        }
+        return -1;
+    };
+    auto Text = [&](Il2CppObject *o, std::vector<std::string> &out) {   // only real text objects
+        if (o && o->klass == strK && out.size() < 4000) out.push_back(((BNM::Structures::Mono::String *)o)->str());
+    };
+    auto Arr = [&](uint8_t *a, std::vector<std::string> &out, int stride, int at, int limit) {
+        if (!a || !((Il2CppObject *)a)->klass) return;
+        size_t len = *(uintptr_t *)(a + 0x18);
+        for (size_t i = 0; i < len && (int)i < limit && i < 4000; i++) Text(*(Il2CppObject **)(a + 0x20 + i * stride + at), out);
+    };
+    // What a field holds: 1 = List<String>, 2 = String[], 3 = Dictionary<String,..> (its names), 4 = HashSet<String>
+    auto KindOf = [](const std::string &t) {
+        if (t == "System.Collections.Generic.List<System.String>") return 1;
+        if (t == "System.String[]") return 2;
+        if (t.rfind("System.Collections.Generic.Dictionary<System.String,", 0) == 0) return 3;
+        if (t == "System.Collections.Generic.HashSet<System.String>") return 4;
+        return 0;
+    };
+    auto Read = [&](Il2CppObject *col, int kind, std::vector<std::string> &out) {
+        if (!col || !col->klass) return;
+        if (kind == 2) { Arr((uint8_t *)col, out, sizeof(void *), 0, 1 << 30); return; }
+        if (kind == 1) {
+            int io = FieldOff(col, {"_items", "items"}), so = FieldOff(col, {"_size", "size"});
+            if (io < 0 || so < 0) return;
+            Arr(*(uint8_t **)((uint8_t *)col + io), out, sizeof(void *), 0, *(int *)((uint8_t *)col + so));
+            return;
+        }
+        // Dictionary / HashSet: each entry starts {int hash; int next; then the name}
+        int eo = FieldOff(col, {"_entries", "entries", "_slots", "m_slots"});
+        if (eo < 0) return;
+        uint8_t *entries = *(uint8_t **)((uint8_t *)col + eo);
+        if (!entries || !((Il2CppObject *)entries)->klass) return;
+        int stride = elemSize(((Il2CppObject *)entries)->klass);
+        if (stride < 16 || stride > 64) return;
+        Arr(entries, out, stride, 8, 1 << 30);
+    };
+    void *image = getImage(itemK);
+    size_t n = image ? count(image) : 0;
+    int added = 0, checkedClasses = 0;
+    for (size_t i = 0; i < n && checkedClasses < 400; i++) {
+        void *k = getClass(image, i);
+        const char *nm = k ? r.className(k) : nullptr;
+        if (!nm || (isGeneric && isGeneric(k)) || !r.isSub(k, uobjClass, false)) continue;
+        bool want = false;
+        for (const char *w : {"Item", "Build", "Store", "Block", "Inventory", "Prefab", "Spawn", "Catalog", "Database", "Shop", "Manager", "Messenger"})
+            want |= strstr(nm, w) != nullptr;
+        if (!want) continue;
+        // its text-list fields (its own and its parents', not static)
+        std::vector<std::pair<int, int>> fields;               // offset, kind
+        for (void *c = k; c && c != uobjClass; c = r.getParent(c)) {
+            void *iter = nullptr;
+            while (void *f = r.getFields(c, &iter)) {
+                if (r.fieldFlags(f) & 0x10) continue;
+                int tk = r.typeKind(r.fieldType(f));
+                if (tk != 0x15 && tk != 0x1d) continue;
+                char *tn = typeName(r.fieldType(f));
+                int kind = tn ? KindOf(tn) : 0;
+                if (tn && freeMem) freeMem(tn);
+                int off = (int)r.fieldOffset(f);
+                if (kind && off >= (int)sizeof(Il2CppObject) && off < 0x4000) fields.push_back({off, kind});
+            }
+        }
+        if (fields.empty()) continue;
+        checkedClasses++;
+        Il2CppObject *t = r.typeObject(r.classType(k));
+        uint8_t *objs = nullptr;
+        try { objs = t ? (uint8_t *)G.findAll(t) : nullptr; } catch (...) { continue; }
+        size_t loaded = objs ? *(uintptr_t *)(objs + 0x18) : 0;
+        for (size_t j = 0; j < loaded && j < 4; j++) {               // a few copies is plenty
+            Il2CppObject *o = ((Il2CppObject **)(objs + 0x20))[j];
+            if (!o || !o->klass) continue;
+            for (auto &fk : fields) {
+                std::vector<std::string> names;
+                try { Read(*(Il2CppObject **)((uint8_t *)o + fk.first), fk.second, names); } catch (...) { continue; }
+                if (names.size() < 2) continue;
+                bool trusted = false;
+                for (auto &s2 : names) if (std::binary_search(confirmed.begin(), confirmed.end(), s2)) { trusted = true; break; }
+                if (!trusted) continue;
+                ym::log("clientdabell: item spawner: %s list has %d names, used", nm, (int)names.size());
+                g_classListsUsed++;
+                if (g_listFrom.empty()) g_listFrom = nm;
+                for (auto &s2 : names) { size_t before = g_seenKeys.size(); SeeKey(s2); added += g_seenKeys.size() > before; }
+            }
+        }
+    }
+    return added;
+}
+
 static void ScanCatalog() {
     if (!G.tItem || !G.itemKey.IsValid()) { Notify("Item list isn't available in this game"); return; }
     int errors = 0, all = 0, room = 0;
@@ -2559,6 +2685,8 @@ static void ScanCatalog() {
     int defs = 0, fromNet = 0;
     try { FindItemDefinitions(); defs = ReadItemDefinitions(); } catch (...) { errors++; }
     try { fromNet = ReadNetLists(); } catch (...) { errors++; }
+    int fromParts = 0;
+    try { fromParts = ReadLoadedLists(); } catch (...) { errors++; }
     std::vector<std::string> keys = g_seenKeys;
     std::sort(keys.begin(), keys.end());
     g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
@@ -2568,10 +2696,13 @@ static void ScanCatalog() {
     g_page = 0;
     ym::log("clientdabell: item spawner: %d kinds (loaded=%d room=%d defs=%d in %s, errors=%d)", (int)g_catalog.size(), all, room,
             defs, g_defFound ? g_defName.c_str() : "-", errors);
-    ym::log("clientdabell: item spawner: %d new from %d game lists", fromNet, g_netListsUsed);
-    if (g_seenKeys.empty() || (!g_defFound && g_netListsUsed == 0))
-        Notify("%d items (lists=%d; spawn or hold an item, then reopen)", (int)g_catalog.size(), g_netListsUsed);
-    else Notify("%d items (lists=%d)", (int)g_catalog.size(), g_netListsUsed);
+    ym::log("clientdabell: item spawner: %d new from %d game lists, %d new from %d part lists (%s)", fromNet, g_netListsUsed,
+            fromParts, g_classListsUsed, g_listFrom.c_str());
+    int lists = g_netListsUsed + g_classListsUsed;
+    if (g_seenKeys.empty() || (!g_defFound && lists == 0))
+        Notify("%d items (lists=0; hold or spawn an item, then reopen)", (int)g_catalog.size());
+    else if (!g_listFrom.empty()) Notify("%d items (lists=%d, from %s)", (int)g_catalog.size(), lists, g_listFrom.c_str());
+    else Notify("%d items (lists=%d)", (int)g_catalog.size(), lists);
 }
 // Tapping an item in the list: one of it appears 80 cm in front of you. Same limits as
 // Spawn On Hand: one every 0.3 s, through the item queue (2 sent per frame, 32 waiting at most).
