@@ -2686,7 +2686,9 @@ static void ApplyLoop() {
 static constexpr int kMaxSpeakers = 16;
 static constexpr float kSongSecs = 5.0f, kQuietSecs = 1.0f, kPauseSecs = 0.3f, kLoud = 0.015f, kMutedVol = 0.02f;
 static struct SpeakerWatch { Ref src; float loudRun = 0, quietRun = 0, volBefore = 1; bool muted = false; } g_spk[kMaxSpeakers];
-static int g_spkN = 0;
+static int g_spkN = 0, g_spkFound = -1;           // voices being watched; Speakers in the scene
+static float g_spkMaxLevel = 0;                        // loudest voice since the last on-screen report
+static double g_nextSpkReport = 0;
 static Ref g_spkBuf;
 static double g_nextSpkFind = 0, g_nextSpkMeasure = 0;
 
@@ -2710,10 +2712,20 @@ static void FindSpeakers() {
     auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tSpeaker)
                                                   : G.findSceneByType((Il2CppObject *)G.tSpeaker, 0));
     size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    g_spkFound = (int)n;
     for (size_t i = 0; i < n; i++) {
         Il2CppObject *sp = ((Il2CppObject **)(arr + 0x20))[i];
         Il2CppObject *go = Alive(sp) ? G.compGameObject[sp]() : nullptr;
         Il2CppObject *src = go ? G.goGetComponent[go](G.tAudioSource) : nullptr;
+        if (!Alive(src) && go && G.getComponentsInChildren.IsValid()) {       // on a child object
+            auto *ca = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tAudioSource, true);
+            if (ca && *(uintptr_t *)(ca + 0x18) > 0) src = ((Il2CppObject **)(ca + 0x20))[0];
+        }
+        if (!Alive(src) && go && G.trGetParent.IsValid()) {                   // or on the parent
+            Il2CppObject *pt = G.trGetParent[Tr(go)]();
+            Il2CppObject *pgo = pt ? G.compGameObject[pt]() : nullptr;
+            if (pgo) src = G.goGetComponent[pgo](G.tAudioSource);
+        }
         if (!Alive(src) || src == g_audioSrc.get()) continue;
         bool known = false;
         for (int k = 0; k < g_spkN && !known; k++) known = g_spk[k].src.get() == src;
@@ -2734,6 +2746,14 @@ static void DisableSongsTick() {
     if (!f_disableSongs && g_spkN > 0) DisableSongsReset();   // switched off some other way (Turn Everything Off): unmute everyone
     if (!f_disableSongs || !G.tSpeaker || !G.asGetOutputData.IsValid() || !G.asSetVolume.IsValid() || !G.arrayNew || !G.floatClass) return;
     if (g_time >= g_nextSpkFind) { g_nextSpkFind = g_time + 2.0; FindSpeakers(); }
+    if (g_time >= g_nextSpkReport) {                     // on-screen check (for fixing it): what it sees
+        g_nextSpkReport = g_time + 3.0;
+        float run = 0;
+        int muted = 0;
+        for (int k = 0; k < g_spkN; k++) { run = std::max(run, g_spk[k].loudRun); muted += g_spk[k].muted; }
+        Notify("Songs: speakers=%d voices=%d loud=%.3f run=%.1fs muted=%d", g_spkFound, g_spkN, g_spkMaxLevel, run, muted);
+        g_spkMaxLevel = 0;
+    }
     if (g_time < g_nextSpkMeasure) return;
     const float step = 0.1f;
     g_nextSpkMeasure = g_time + step;
@@ -2751,6 +2771,7 @@ static void DisableSongsTick() {
         float rms = sqrtf((float)(sum / 1024));
         // While muted the volume is turned down, so scale back up to how loud they really are
         float level = w.muted ? rms / kMutedVol : rms;
+        if (level > g_spkMaxLevel) g_spkMaxLevel = level;
         if (level > kLoud) { w.loudRun += step; w.quietRun = 0; }
         else {
             w.quietRun += step;
