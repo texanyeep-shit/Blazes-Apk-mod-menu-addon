@@ -2457,9 +2457,10 @@ static int ReadNetLists() {
     Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
     void *itemK = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
     if (!r.ok || !staticGet || !typeName || !elemClass || !isValue || !elemSize || !net.IsValid() || !itemK) return 0;
-    if (!G.netLocal.IsValid() || !G.netLocal()) return 0;                 // only once the game has it running
+    if (!G.netLocal.IsValid()) return 0;
+    Il2CppObject *inst = G.netLocal();                                    // the game's own running copy
+    if (!inst || !inst->klass) return 0;
     std::vector<std::string> confirmed = g_seenKeys;
-    if (confirmed.empty()) return 0;
     std::sort(confirmed.begin(), confirmed.end());
     auto FieldOff = [&](Il2CppObject *o, const char *a, const char *b) {
         for (void *c = o->klass; c; c = r.getParent(c)) {
@@ -2491,7 +2492,7 @@ static int ReadNetLists() {
     g_netListsUsed = 0;
     void *iter = nullptr;
     while (void *f = r.getFields(net.GetClass(), &iter)) {
-        if (!(r.fieldFlags(f) & 0x10)) continue;                          // static only
+        bool isStatic = (r.fieldFlags(f) & 0x10) != 0;
         char *tn = typeName(r.fieldType(f));
         std::string t = tn ? tn : "";
         if (tn && freeMem) freeMem(tn);
@@ -2501,7 +2502,12 @@ static int ReadNetLists() {
         else if (t == "System.Collections.Generic.Dictionary<System.String,System.Collections.Generic.List<System.String>>") kind = 3;
         if (!kind) continue;
         Il2CppObject *col = nullptr;
-        staticGet(f, &col);
+        if (isStatic) staticGet(f, &col);
+        else {                                                            // a field of the running copy (List<Item> is one)
+            int off = (int)r.fieldOffset(f);
+            if (off < (int)sizeof(Il2CppObject) || off > 0x4000) continue;
+            col = *(Il2CppObject **)((uint8_t *)inst + off);
+        }
         if (!col || !col->klass) continue;
         std::vector<std::string> names;
         if (kind == 1) { std::vector<Il2CppObject *> v; ListItems(col, v); for (auto *o : v) Str(o, names); }
@@ -2527,9 +2533,9 @@ static int ReadNetLists() {
                 for (auto *o : v) Str(o, names);
             }
         }
-        bool trusted = false;
+        bool trusted = kind == 2 && !names.empty();                       // real Item objects: nothing to double-check
         for (auto &nm : names) if (std::binary_search(confirmed.begin(), confirmed.end(), nm)) { trusted = true; break; }
-        ym::log("clientdabell: item spawner: game list (%s) has %d names, %s", t.c_str(), (int)names.size(), trusted ? "used" : "not items");
+        ym::log("clientdabell: item spawner: game list (%s%s) has %d names, %s", isStatic ? "static " : "", t.c_str(), (int)names.size(), trusted ? "used" : "not items");
         if (!trusted) continue;
         g_netListsUsed++;
         for (auto &nm : names) { size_t before = g_seenKeys.size(); SeeKey(nm); added += g_seenKeys.size() > before; }
