@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v.1.2.6"
+#define CDB_VERSION "v.1.2.8"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -91,6 +91,12 @@ static struct {
     Method<Il2CppObject *> audioClipCreate;           // soundboard
     Method<bool> audioClipSetData, audioClipGetData;
     Method<int> audioClipSamples, asGetTimeSamples;
+    Method<float> asGetVolume;
+    Method<void> asSetMute;
+    Method<bool> asGetMute;
+    Method<void> asGetOutputData;                      // Disable Songs: how loud another player is (if the game has it)
+    Method<Il2CppObject *> asGetClip;                  // ...else read the clip Photon writes their voice into
+    BNM::MonoType *tSpeaker = nullptr;                 // Photon Voice's Speaker: plays another player's voice
     Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
     Method<bool> asIsPlaying;
     BNM::MonoType *tAudioSource = nullptr;
@@ -173,8 +179,21 @@ static bool Lookups() {
             G.asPlay = asrc.GetMethod("Play", 0);
             G.asStop = asrc.GetMethod("Stop", 0);
             G.asGetTimeSamples = asrc.GetMethod("get_timeSamples", 0);     // where the song is now
+            G.asGetVolume = asrc.GetMethod("get_volume", 0);
+            G.asGetClip = asrc.GetMethod("get_clip", 0);
+            G.asSetMute = asrc.GetMethod("set_mute", 1);
+            G.asGetMute = asrc.GetMethod("get_mute", 0);
+            for (auto &m : asrc.GetMethods(false)) {          // GetOutputData(float[], int): the array one, not (int, int)
+                auto *mi = m.GetInfo();
+                if (!mi || !mi->name || strcmp(mi->name, "GetOutputData") != 0 || mi->parameters_count != 2) continue;
+                std::string t0 = TypeName(mi->parameters[0]);
+                ym::log("clientdabell: AudioSource.GetOutputData(%s, %s)", t0.c_str(), TypeName(mi->parameters[1]).c_str());
+                if (t0 != "System.Int32") G.asGetOutputData = m;
+            }
             G.asIsPlaying = asrc.GetMethod("get_isPlaying", 0);
         }
+        Class spk("Photon.Voice.Unity", "Speaker");
+        if (spk.IsValid()) G.tSpeaker = spk.GetMonoType();
         Class rec("Photon.Voice.Unity", "Recorder");
         if (rec.IsValid()) {
             G.tRecorder = rec.GetMonoType();
@@ -441,13 +460,20 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash;
+static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash, f_itemOrbit;
 static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_overlap = false;                  // Play while a song plays mixes the two together
+static bool f_disableSongs = false;             // mute other players while they play music
+static bool f_colorBlind = false;               // Settings: on-buttons say [ON] and use colors everyone can tell apart
+static bool f_barkMode = false;                 // Settings: the menu is a panel in front of you instead of on your hand
+static bool g_rebuildMenu = false;              // Bark Mode switched: build the menu again next frame
+static bool g_barkPlaced = false;               // the Bark Mode panel has been put in front of you for this opening
+static bool g_rebuiltNote = false;              // say how to open the menu once it's built again
+static bool g_barkOpen = false;                 // Bark Mode: the panel is open (a press opens it, another closes it)
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
-struct PendingItem { Vector3 pos, vel; bool drop = false; };   // drop: make it fall once it appears (Item Rain)
+struct PendingItem { Vector3 pos, vel; bool drop = false, orbit = false; };   // once it appears: drop it (Item Rain) / add it to Item Orbit
 static std::vector<PendingItem> g_itemQueue;
 static double g_nextItem = 0, g_nextBatch = 0;
 static int g_dupeArmed = 0;
@@ -481,6 +507,8 @@ static void ArmDupe9();
 static void ArmDupe27();
 static void ArmDupe9x3();
 static void ItemRain();
+static void ItemCircle();
+static void ItemOrbitToggled();
 static bool LeftHandItem();
 static void ScanSongs();
 static void PlaySong();
@@ -489,6 +517,8 @@ static void PrevSong();
 static void StopSound();
 static void ApplyLoop();
 static void NextSoundVolume();
+static void DisableSongsToggled();
+static void BarkModeToggled();
 static void SoundMicToggled();
 static void WeatherPicked();
 static void LongArmsToggled();
@@ -498,8 +528,8 @@ static void OverpoweredOff();
 static void NextWeatherIntensity();
 static void TodPicked();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, SPAWNER, BLOCKS, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers", "Item Spawner", "Game Finder"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -564,12 +594,16 @@ static Item g_items[] = {
     {RIG, "Beyblade", TOGGLE, MAIN, &g_danceSel[7], DancePicked},
 
     {ITEMS, "Exit Items", OPEN, MAIN},
+    {ITEMS, "Item Spawner", OPEN, SPAWNER},
+    {ITEMS, "Game Finder", OPEN, BLOCKS},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
     {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
     {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
     {ITEMS, "Item Rain", ACTION, MAIN, nullptr, ItemRain},
+    {ITEMS, "Item Circle", ACTION, MAIN, nullptr, ItemCircle},
+    {ITEMS, "Item Orbit", TOGGLE, MAIN, &f_itemOrbit, ItemOrbitToggled},
 
     {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
     {SOUNDBOARD, g_soundLabel, ACTION, MAIN, nullptr, PlaySong},
@@ -579,6 +613,7 @@ static Item g_items[] = {
     {SOUNDBOARD, "Others Hear It", TOGGLE, MAIN, &f_soundMic, SoundMicToggled},
     {SOUNDBOARD, "Loop", TOGGLE, MAIN, &f_soundLoop, ApplyLoop},
     {SOUNDBOARD, "Overlap Songs", TOGGLE, MAIN, &f_overlap},
+    {SOUNDBOARD, "Disable Songs", TOGGLE, MAIN, &f_disableSongs, DisableSongsToggled},
     {SOUNDBOARD, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
     {SOUNDBOARD, "Rescan Songs", ACTION, MAIN, nullptr, ScanSongs},
 
@@ -613,8 +648,10 @@ static Item g_items[] = {
     {SETTINGS, "Iron Man Speed", ACTION, MAIN, nullptr, NextIronSpeed},
     {SETTINGS, "Car Speed", ACTION, MAIN, nullptr, NextCarSpeed},
     {SETTINGS, "Right Hand Menu", TOGGLE, MAIN, &f_rightHand, PointerToHand},
+    {SETTINGS, "Bark Mode", TOGGLE, MAIN, &f_barkMode, BarkModeToggled},
     {SETTINGS, "Change Menu Theme", ACTION, MAIN, nullptr, NextTheme},
     {SETTINGS, "Rainbow Menu", TOGGLE, MAIN, &f_rainbow},
+    {SETTINGS, "Color Blind Mode", TOGGLE, MAIN, &f_colorBlind},
     {SETTINGS, "Show FPS", TOGGLE, MAIN, &f_fps},
     {SETTINGS, "Show Clock", TOGGLE, MAIN, &f_clock},
     {SETTINGS, "Notifications", TOGGLE, MAIN, &f_notify},
@@ -631,12 +668,31 @@ static Item g_items[] = {
 };
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
+static void DisableAllMods();
+// Item Spawner: a list built from the game's own items (every item kind it has loaded).
+static std::vector<std::string> g_catalog;              // item kinds (their keys), sorted
+static std::vector<Item> g_spawnView;                    // one button per kind (labels point into g_catalog)
+static void SpawnPicked();
+static Item g_spawnExit = {SPAWNER, "Exit Item Spawner", OPEN, ITEMS};
+// Block Finder: every kind of game object with "Block" in its name, and how many are loaded.
+static std::vector<std::string> g_blockInfo;
+static std::vector<Item> g_blockView;
+static Item g_blockExit = {BLOCKS, "Exit Game Finder", OPEN, ITEMS};
+static Item *g_lastPressed = nullptr;                   // the button being pressed right now (for SpawnPicked)
+static bool f_modsPaused = false;               // Enabled Mods -> Disable All Mods is on: the mods that were on are saved here
+static std::vector<Item *> g_pausedMods;
+static Item g_disableAllItem = {ENABLED, "Disable All Mods", TOGGLE, MAIN, &f_modsPaused, DisableAllMods};
+// What the Enabled Mods page lists: switches that are on, except settings that aren't mods.
+static bool ListedAsMod(const Item &it) {
+    return it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_colorBlind && it.flag != &f_barkMode;
+}
 
 // Tooltips, shown under the menu while your finger is on a button (like ii's).
 static const struct { const char *label, *tip; } kTips[] = {
     {"Settings", "Opens the settings."},
     {"Movement Mods", "Opens the movement mods."},
     {"Enabled Mods", "Shows every mod you have on."},
+    {"Disable All Mods", "On: turns off every mod on this page. Off again: turns the same mods back on."},
     {"Credits", "Who made this menu."},
     {"Beta Testers", "The people who test ClientDaBell."},
     {"@cart3rrrrr", "Beta tester."},
@@ -658,6 +714,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Go To Spot", "Teleports you to your saved spot."},
     {"Change Menu Theme", "Plush Blue, Orange, Blue, Green, Purple, Dark."},
     {"Rainbow Menu", "The menu cycles through colors."},
+    {"Color Blind Mode", "Buttons that are on say [ON] and turn orange with dark text; pressed buttons flash white."},
     {"Show FPS", "Frames per second in the title."},
     {"Show Clock", "The time in the title."},
     {"Rig Mods", "Pick a dance, then hold left trigger. Everyone sees it."},
@@ -667,6 +724,10 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
+    {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
+    {"Game Finder", "Shows how the game stores items and blocks (for the full item list). Send a video of all its pages."},
+    {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
+    {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
     {"Helicopter", "Both arms spin around you. Hold left trigger."},
@@ -683,6 +744,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Stop Sound", "Stops the song (and cancels a loading one)."},
     {"Loop", "Repeats the song until you stop it."},
     {"Overlap Songs", "On: Play while a song plays adds the new song on top. Both go through voice chat."},
+    {"Disable Songs", "Mutes a player for you while they play music, unmutes them when it stops. A guess, by how steady the sound is."},
     {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
     {"Rescan Songs", "Looks in the sounds folder again."},
     {"Effects", "Weather, discos and time of day. Only you see them."},
@@ -718,6 +780,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Change Pointer Position", "Moves the ball on your finger."},
     {"Iron Man Speed", "Changes how strong Iron Man is."},
     {"Right Hand Menu", "Hold B, menu on your right hand."},
+    {"Bark Mode", "Press Y to open a big panel in front of you (like the bark menu); press again to close it."},
     {"Notifications", "Messages when you switch something."},
     {"Turn Everything Off", "Switches every mod off."},
 };
@@ -746,10 +809,33 @@ static const Theme &T() { return kThemes[g_theme]; }
 // Layout in meters, matching ii's menu as it was ported to Yeeps. Everything is drawn
 // on a "board" object: +x goes across, +y goes up, the player looks at it from -z.
 static constexpr int kRows = 8;                                   // buttons per page
-static const float kBoardW = 0.30f, kBoardH = 0.3825f, kBtnW = 0.27f, kBtnH = 0.0306f;
-static const float kHomeY = -0.2175f, kHomeW = 0.12f, kHomeH = 0.032f;   // Home button just under the board
-static const float kTitleY = 0.235f, kSideX = 0.2f, kSideW = 0.06f, kSideH = 0.344f;
-static float RowY(int r) { return 0.13f - r * 0.04f; }
+// These change with Bark Mode (SetLayout); the hand menu values are the defaults.
+static float kBoardW = 0.30f, kBoardH = 0.3825f, kBtnW = 0.27f, kBtnH = 0.0306f;
+static float kHomeY = -0.2175f, kHomeW = 0.12f, kHomeH = 0.032f;   // Home button just under the board
+static float kTitleY = 0.235f, kSideX = 0.2f, kSideW = 0.06f, kSideH = 0.344f;
+static int g_btnFont = 19, g_titleFont = 32;
+static bool g_barkLayout = false;                   // the menu is built as the Bark Mode panel
+// Bark Mode: a wide panel that floats in front of you (like Gorilla Tag's bark menu): the
+// title at the top, the version in the top-right corner, 8 buttons in 2 columns of 4, tall
+// < and > buttons inside the left and right edges, Home at the bottom.
+static void SetLayout(bool bark) {
+    g_barkLayout = bark;
+    if (bark) {
+        kBoardW = 0.62f; kBoardH = 0.42f; kBtnW = 0.20f; kBtnH = 0.058f;
+        kHomeY = -0.175f; kHomeW = 0.14f; kHomeH = 0.04f;
+        kTitleY = 0.165f; kSideX = 0.25f; kSideW = 0.05f; kSideH = 0.27f;
+        g_btnFont = 26; g_titleFont = 44;
+    } else {
+        kBoardW = 0.30f; kBoardH = 0.3825f; kBtnW = 0.27f; kBtnH = 0.0306f;
+        kHomeY = -0.2175f; kHomeW = 0.12f; kHomeH = 0.032f;
+        kTitleY = 0.235f; kSideX = 0.2f; kSideW = 0.06f; kSideH = 0.344f;
+        g_btnFont = 19; g_titleFont = 32;
+    }
+}
+// Where button r (0..7) sits: one column on the hand menu; in Bark Mode two columns,
+// left to right then down.
+static float RowY(int r) { return g_barkLayout ? 0.095f - (r / 2) * 0.072f : 0.13f - r * 0.04f; }
+static float RowX(int r) { return g_barkLayout ? (r % 2 ? 1.0f : -1.0f) * 0.112f : 0.0f; }
 
 static Ref g_menu, g_board, g_bg, g_outline, g_pointer, g_title, g_titleBar;
 static Ref g_rowCube[kRows], g_rowLabel[kRows], g_rowText[kRows];
@@ -767,11 +853,48 @@ static float g_fps = 0;
 
 static int PageCount() { return g_view.empty() ? 1 : (int)(g_view.size() + kRows - 1) / kRows; }
 
+// Enabled Mods -> Disable All Mods (a switch). On: every mod on that page is switched off the
+// normal way (the switch goes off, then its own off code runs) and remembered. Off: the
+// remembered ones are switched back on the same way.
+static void DisableAllMods() {
+    int n = 0;
+    if (f_modsPaused) {
+        g_pausedMods.clear();
+        for (auto &it : g_items) {
+            if (!ListedAsMod(it)) continue;
+            g_pausedMods.push_back(&it);
+            *it.flag = false;
+            if (it.fn) { try { it.fn(); } catch (...) {} }
+            n++;
+        }
+        Notify(n ? "Disabled %d mods" : "Nothing to disable", n);
+    } else {
+        for (Item *it : g_pausedMods) {
+            if (*it->flag) continue;                     // you turned it back on yourself already
+            *it->flag = true;
+            if (it->fn) { try { it->fn(); } catch (...) {} }
+            n++;
+        }
+        g_pausedMods.clear();
+        Notify(n ? "Turned %d mods back on" : "Nothing to turn back on", n);
+    }
+    g_dirty = true;
+}
+
 static void BuildView() {
     g_view.clear();
-    if (g_cat == ENABLED) {
+    if (g_cat == BLOCKS) {
+        g_view.push_back(&g_blockExit);
+        for (auto &it : g_blockView) g_view.push_back(&it);
+    } else if (g_cat == SPAWNER) {
+        g_view.push_back(&g_spawnExit);
+        for (auto &it : g_spawnView) g_view.push_back(&it);
+    } else if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
-        for (auto &it : g_items) if (it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic) g_view.push_back(&it);
+        bool any = f_modsPaused;                          // the switch stays while mods are saved
+        for (auto &it : g_items) any |= ListedAsMod(it);
+        if (any) g_view.push_back(&g_disableAllItem);
+        for (auto &it : g_items) if (ListedAsMod(it)) g_view.push_back(&it);
     } else {
         for (auto &it : g_items) if (it.cat == g_cat) g_view.push_back(&it);
     }
@@ -905,10 +1028,11 @@ static void BuildDecor(Il2CppObject *bt) {
         Decor(bt, 3, red, Vector3(-hw, y, z), Vector3(bar * 1.05f, 0.024f, 0.0125f), 0.0f);
         Decor(bt, 3, red, Vector3(hw, y, z), Vector3(bar * 1.05f, 0.024f, 0.0125f), 0.0f);
     }
-    CandyCane(bt, -kSideX, kTitleY, 1);
-    CandyCane(bt, kSideX, kTitleY, -1);
-    Pumpkin(bt, -kSideX, -0.215f);
-    Pumpkin(bt, kSideX, -0.215f);
+    float caneX = g_barkLayout ? kBoardW / 2 - 0.035f : kSideX, caneY = g_barkLayout ? kBoardH / 2 + 0.03f : kTitleY;
+    CandyCane(bt, -caneX, caneY, 1);
+    CandyCane(bt, caneX, caneY, -1);
+    Pumpkin(bt, -caneX, -kBoardH / 2 - 0.024f);
+    Pumpkin(bt, caneX, -kBoardH / 2 - 0.024f);
     ym::log("clientdabell: %d decorations", g_decorN);
 }
 
@@ -930,23 +1054,25 @@ static void BuildMenu() {
     g_outline.set(Part(bt, T().title, Vector3(0, 0, 0.004f), Vector3(kBoardW + 0.008f, kBoardH + 0.008f, 0.004f)));
     g_bg.set(Part(bt, T().bgA, Vector3(0, 0, 0), Vector3(kBoardW, kBoardH, 0.01f)));
     for (int r = 0; r < kRows; r++)
-        g_rowCube[r].set(Part(bt, T().button, Vector3(0, RowY(r), -0.005f), Vector3(kBtnW, kBtnH, 0.009f)));
+        g_rowCube[r].set(Part(bt, T().button, Vector3(RowX(r), RowY(r), -0.005f), Vector3(kBtnW, kBtnH, 0.009f)));
     g_prev.set(Part(bt, T().button, Vector3(-kSideX, 0, 0), Vector3(kSideW, kSideH, 0.009f)));
     // The title sits on its own dark bar above the board (where ii's Disconnect button was)
-    g_titleBar.set(Part(bt, T().buttonOn, Vector3(0, kTitleY, -0.002f), Vector3(kBtnW, 0.045f, 0.009f)));
+    // (Bark Mode: the title is written right on the panel, no bar)
+    if (!g_barkLayout) g_titleBar.set(Part(bt, T().buttonOn, Vector3(0, kTitleY, -0.002f), Vector3(kBtnW, 0.045f, 0.009f)));
     g_next.set(Part(bt, T().button, Vector3(kSideX, 0, 0), Vector3(kSideW, kSideH, 0.009f)));
     g_homeCube.set(Part(bt, T().button, Vector3(0, kHomeY, -0.005f), Vector3(kHomeW, kHomeH, 0.009f)));
 
-    if (Il2CppObject *canvas = Canvas(bt, Vector3(0, 0, -0.0105f), kBoardW + 2 * kSideX, kBoardH + 0.1f)) {
+    if (Il2CppObject *canvas = Canvas(bt, Vector3(0, 0, -0.0105f), std::max(kBoardW, 2 * kSideX + kSideW), kBoardH + 0.2f)) {
         Il2CppObject *ct = Tr(canvas);
-        Label(ct, "ClientDaBell", Vector3(0, kTitleY, 0), kBtnW, 0.045f, 32, &g_title);
+        Label(ct, "ClientDaBell", Vector3(0, kTitleY, 0), g_barkLayout ? 0.4f : kBtnW, g_barkLayout ? 0.06f : 0.045f, g_titleFont, &g_title);
         for (int r = 0; r < kRows; r++)
-            g_rowLabel[r].set(Label(ct, "", Vector3(0, RowY(r), 0), kBtnW, kBtnH, 19, &g_rowText[r]));
+            g_rowLabel[r].set(Label(ct, "", Vector3(RowX(r), RowY(r), 0), kBtnW - 0.01f, kBtnH, g_btnFont, &g_rowText[r]));
         Label(ct, "<", Vector3(-kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
         Label(ct, ">", Vector3(kSideX, 0, -0.0005f), kSideW, 0.05f, 34, nullptr);
-        g_homeLabel.set(Label(ct, "Home", Vector3(0, kHomeY, 0), kHomeW, kHomeH, 19, nullptr));
-        Label(ct, "", Vector3(0, -kBoardH / 2 - 0.09f, 0), kBoardW, 0.03f, 17, &g_tipText);
-        Label(ct, CDB_VERSION, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
+        g_homeLabel.set(Label(ct, "Home", Vector3(0, kHomeY, 0), kHomeW, kHomeH, g_btnFont, nullptr));
+        Label(ct, "", Vector3(0, -kBoardH / 2 - (g_barkLayout ? 0.04f : 0.09f), 0), kBoardW, 0.03f, 17, &g_tipText);
+        if (g_barkLayout) Label(ct, CDB_VERSION, Vector3(kBoardW / 2 - 0.07f, kBoardH / 2 - 0.025f, 0), 0.12f, 0.025f, 16, nullptr);   // top-right corner
+        else Label(ct, CDB_VERSION, Vector3(0, -kBoardH / 2 + 0.012f, 0), kBoardW, 0.02f, 11, nullptr);
     }
     BuildDecor(bt);
     // Pointer: a small ball on the index finger of the other hand
@@ -990,6 +1116,19 @@ static void RenderPage() {
         if (!used) continue;
         Item *it = g_view[i];
         bool on = it->kind == TOGGLE && *it->flag;
+        if (f_colorBlind) {
+            // Color Blind Mode: "on" doesn't depend on telling two shades apart. On buttons
+            // say [ON] and are orange with near-black text (orange against the blue themes is
+            // the pair the common kinds of color blindness all still tell apart, and the
+            // brightness differs a lot too); a press flashes white.
+            char lab[96];
+            snprintf(lab, sizeof lab, on ? "[ON] %s" : "%s", it->label);
+            SetText(g_rowText[r], lab);
+            SetColor(g_rowCube[r].get(), r == g_flashRow ? Color(1, 1, 1, 1) : on ? Color(0.90f, 0.62f, 0.0f, 1) : T().button);
+            if (Alive(g_rowText[r].get()))
+                G.graphicSetColor[g_rowText[r].get()](r == g_flashRow || on ? Color(0.08f, 0.08f, 0.08f, 1) : Color(1, 1, 1, 1));
+            continue;
+        }
         SetText(g_rowText[r], it->label);
         SetColor(g_rowCube[r].get(), r == g_flashRow ? Color(1, 0.9f, 0.6f, 1) : on ? T().buttonOn : T().button);
         if (Alive(g_rowText[r].get())) G.graphicSetColor[g_rowText[r].get()](on ? Color(1, 1, 1, 1) : T().title);
@@ -1001,7 +1140,7 @@ static void RenderPage() {
     SetColor(g_next.get(), T().button);
     Show(g_homeCube, g_cat != MAIN);
     Show(g_homeLabel, g_cat != MAIN);
-    SetColor(g_homeCube.get(), g_flashRow == -3 ? Color(1, 0.9f, 0.6f, 1) : T().button);
+    SetColor(g_homeCube.get(), g_flashRow == -3 ? (f_colorBlind ? Color(1, 1, 1, 1) : Color(1, 0.9f, 0.6f, 1)) : T().button);
     SetColor(g_outline.get(), T().title);
     SetColor(g_titleBar.get(), T().buttonOn);
     SetColor(g_pointer.get(), T().bgB);
@@ -1046,7 +1185,7 @@ static void UpdateTitle() {
 static void ShowMenu(bool show) {
     if (show == g_menuShown) return;
     g_menuShown = show;
-    if (show) { g_openTime = g_time; g_dirty = true; g_hover = -2; SetText(g_tipText, ""); }
+    if (show) { g_openTime = g_time; g_dirty = true; g_hover = -2; SetText(g_tipText, ""); g_barkPlaced = false; }
     Show(g_menu, show);
     Show(g_pointer, show);
     g_touching = -2;
@@ -1062,6 +1201,26 @@ static void PlaceMenu() {
     Il2CppObject *hand = f_rightHand ? g_rightHand.get() : g_leftHand.get();
     if (!Alive(menu) || !Alive(board) || !hand || !head) return;
     Il2CppObject *t = Tr(menu), *bt = Tr(board);
+    if (g_barkLayout) {                                  // Bark Mode: put once in front of you when it opens, then it stays
+        if (g_barkPlaced) return;
+        Vector3 hp = G.trGetPosition[head](), f = G.trGetForward[head]();
+        f.y = 0;
+        float n = sqrtf(f.x * f.x + f.z * f.z);
+        if (n < 1e-4f) return;
+        f = f * (1.0f / n);
+        Vector3 center = hp + f * 0.55f + Vector3(0, -0.18f, 0);
+        Vector3 tilt = f + Vector3(0, -0.35f, 0);           // tipped back a little, toward your eyes
+        // Move the menu object itself and keep the panel at its center (local values only:
+        // the menu object is scaled down to nothing for the pop-open, and setting a world
+        // position under a zero scale sends the panel off to nowhere).
+        G.trSetLocalScale[t](Vector3(1, 1, 1));
+        G.trSetPosition[t](center);
+        G.trSetRotation[t](Quaternion::LookRotation(tilt));
+        G.trSetLocalPosition[bt](Vector3(0, 0, 0));
+        G.trSetLocalRotation[bt](Quaternion(0, 0, 0, 1));
+        g_barkPlaced = true;
+        return;
+    }
     Vector3 handPos = G.trGetPosition[hand]();
     if (!G.trGetRotation.IsValid()) {                  // fallback: float above the hand, facing you
         Vector3 center = handPos + Vector3(0, 0.25f, 0), away = center - G.trGetPosition[head]();
@@ -1080,24 +1239,55 @@ static void PlaceMenu() {
     G.trSetLocalRotation[bt](Quaternion::LookRotation(Vector3(-1, 0, 0), Vector3(0, 0, 1)));
 }
 
+// Bark Mode switched: the menu is torn down here and built again (with the other layout)
+// at the start of the next frame, so nothing is destroyed while it's being pressed.
+static void BarkModeToggled() { g_rebuildMenu = true; }
+static void RebuildMenuNow() {
+    g_rebuildMenu = false;
+    g_rebuiltNote = true;
+    for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
+    for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText, &g_homeCube, &g_homeLabel}) r->clear();
+    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo}) Kill(*r);
+    g_built = false; g_menuShown = false; g_touching = -2; g_hover = -2;
+    g_barkOpen = false;
+    SetLayout(f_barkMode);
+}
+
+static void ScanCatalog();
+static void ScanBlocks();
+static void SaveSettings();
 static void Press(Item *it) {
+    g_lastPressed = it;
     switch (it->kind) {
+    // A button's own code is run inside a safety net: if it fails, that switch goes back off and
+    // you get a message, instead of the error stopping the whole menu.
     case OPEN:
         g_cat = it->target;
         g_page = 0;
-        if (it->target == SOUNDBOARD) ScanSongs();      // lists the songs in the sounds folder
+        if (it->target == SOUNDBOARD) { try { ScanSongs(); } catch (...) { ym::log("clientdabell: song scan error"); } }
+        if (it->target == SPAWNER) { try { ScanCatalog(); } catch (...) { ym::log("clientdabell: item list error"); } }
+        if (it->target == BLOCKS) { try { ScanBlocks(); } catch (...) { ym::log("clientdabell: block finder error"); } }
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
-        if (it->fn) it->fn();
+        try { if (it->fn) it->fn(); }
+        catch (...) {
+            *it->flag = false;
+            try { if (it->fn) it->fn(); } catch (...) {}
+            ym::log("clientdabell: %s error, turned off", it->label);
+            Notify("%s had an error, turned off", it->label);
+            break;
+        }
         Notify("[%s] %s", *it->flag ? "ON" : "OFF", it->label);
         break;
     case ACTION:
-        if (it->fn) it->fn();
+        try { if (it->fn) it->fn(); }
+        catch (...) { ym::log("clientdabell: %s error", it->label); Notify("%s had an error", it->label); }
         break;
     }
     g_dirty = true;
     ym::log("clientdabell: %s", it->label);
+    try { SaveSettings(); } catch (...) {}
 }
 
 // Which part of the menu the pointer touches: row 0..7, -1 = <, kRows = >, -2 = nothing.
@@ -1109,9 +1299,8 @@ static int Touching() {
     if (g_cat != MAIN && fabsf(p.x) < kHomeW / 2 && fabsf(p.y - kHomeY) < kHomeH / 2) return -3;
     if (fabsf(fabsf(p.x) - kSideX) < kSideW / 2 && fabsf(p.y) < kSideH / 2 && PageCount() > 1)
         return p.x < 0 ? -1 : kRows;
-    if (fabsf(p.x) >= kBtnW / 2) return -2;
     for (int r = 0; r < kRows; r++)
-        if (fabsf(p.y - RowY(r)) < kBtnH / 2) return r;
+        if (fabsf(p.x - RowX(r)) < kBtnW / 2 && fabsf(p.y - RowY(r)) < kBtnH / 2) return r;
     return -2;
 }
 
@@ -1215,9 +1404,11 @@ static int g_ironSpeed = 0;
 static void NextIronSpeed() { g_ironSpeed = (g_ironSpeed + 1) % 4; Notify("Iron Man speed: %d", (int)kIronSpeeds[g_ironSpeed]); }
 static void NextTheme() { g_theme = (g_theme + 1) % kThemeCount; Notify("Theme: %s", T().name); }
 static void AllOff() {
-    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_soundMic) *it.flag = false;   // ticks undo each mod
+    for (auto &it : g_items) if (it.kind == TOGGLE && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_colorBlind && it.flag != &f_barkMode) *it.flag = false;   // ticks undo each mod
     g_dance = -1;
     g_dupeArmed = 0;
+    f_modsPaused = false;                           // nothing to bring back after this
+    g_pausedMods.clear();
     g_wx = -1;
     g_tod = -1;
     StopSound();
@@ -1761,14 +1952,18 @@ static void QueueItems(const std::vector<PendingItem> &list) {
 // Item Rain: the game spawns items floating where they appear, so each rained item is found
 // once it exists (by its ID) and dropped: the game's own drop call, then gravity on and a
 // push down. The scene search runs 4 times a second, only while items are waiting.
-struct DropWatch { char id[8]; double until; };
+struct DropWatch { char id[8]; double until; bool orbit; Vector3 pos; };
+static void OrbitAdd(Il2CppObject *it);
+static bool OrbitHas(Il2CppObject *it);
 static std::vector<DropWatch> g_dropWatch;
 static double g_nextDropScan = 0;
-static void DropWatchAdd(const char *id) {
+static void DropWatchAdd(const char *id, bool orbit = false, Vector3 pos = Vector3(0, 0, 0)) {
     if (g_dropWatch.size() >= 64) return;
     DropWatch w{};
     snprintf(w.id, sizeof w.id, "%s", id);
-    w.until = g_time + 3.0;
+    w.until = g_time + 4.0;
+    w.orbit = orbit;
+    w.pos = pos;
     g_dropWatch.push_back(w);
 }
 static void DropItem(Il2CppObject *it) {
@@ -1795,13 +1990,29 @@ static void DropWatchTick() {
     size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
     for (size_t i = 0; i < n && !g_dropWatch.empty(); i++) {
         Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
-        if (!Alive(it)) continue;
+        if (!Alive(it) || OrbitHas(it)) continue;
         auto *s = G.itemId[it]();
-        if (!s) continue;
-        std::string id = s->str();
+        std::string id = s ? s->str() : "";
+        // Matched by its ID; or, if the game gave it a different ID, by being the same kind of
+        // item sitting where one was just spawned (within 40 cm).
+        bool sameKind = false;
+        Vector3 ip;
+        bool havePos = false;
         for (size_t k = 0; k < g_dropWatch.size(); k++) {
-            if (id != g_dropWatch[k].id) continue;
-            DropItem(it);
+            bool match = !id.empty() && id == g_dropWatch[k].id;
+            if (!match) {
+                if (!havePos) {
+                    havePos = true;
+                    auto *ks = G.itemKey[it]();
+                    sameKind = ks && ks->str() == g_itemKey;
+                    ip = G.trGetPosition[G.compTransform[it]()]();
+                }
+                Vector3 d = ip - g_dropWatch[k].pos;
+                match = sameKind && d.x * d.x + d.y * d.y + d.z * d.z < 0.4f * 0.4f;
+            }
+            if (!match) continue;
+            if (g_dropWatch[k].orbit) OrbitAdd(it);
+            else DropItem(it);
             g_dropWatch.erase(g_dropWatch.begin() + k);
             break;
         }
@@ -1814,7 +2025,7 @@ static void ItemQueueTick() {
         g_itemQueue.erase(g_itemQueue.begin());
         char id[8] = {};
         bool ok = SendItem(g_itemKey, p.pos, Quaternion(0, 0, 0, 1), p.vel, id);
-        if (ok && p.drop) DropWatchAdd(id);
+        if (ok && (p.drop || p.orbit)) DropWatchAdd(id, p.orbit, p.pos);
         static int logged = 0;
         if (logged++ < 3) ym::log("clientdabell: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
         if (!ok) { g_itemQueue.clear(); Notify("Item spawning isn't ready in this room"); }
@@ -1838,7 +2049,10 @@ static void SpawnGridDims(int w, int d, int h) {
 static void SpawnGrid(int count) { SpawnGridDims(3, 3, count > 9 ? 3 : 1); }   // 3x3 or 3x3x3
 // The item you're holding in your LEFT hand right now (owner 2026-10-31: items spawn as
 // whatever is in your left hand when you press). One scene search per press.
+static Il2CppObject *g_handItemObj = nullptr;   // the item LeftHandItem just found (use right away only)
+static void SeeKey(const std::string &key);
 static bool LeftHandItem() {
+    g_handItemObj = nullptr;
     Il2CppObject *hand = g_leftHand.get();
     if (!hand || !G.tItem || !G.itemKey.IsValid() || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return false;
     auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem)
@@ -1857,6 +2071,8 @@ static bool LeftHandItem() {
     auto *key = best ? G.itemKey[best]() : nullptr;
     if (!key) { Notify("Hold an item in your left hand"); return false; }
     snprintf(g_itemKey, sizeof g_itemKey, "%s", key->str().c_str());
+    SeeKey(g_itemKey);
+    g_handItemObj = best;
     return true;
 }
 static void ArmDupe9() { if (LeftHandItem()) SpawnGrid(9); }
@@ -1879,8 +2095,392 @@ static void ItemRain() {
     if (g_nextBatch != before) Notify("Item Rain!");
 }
 
+// Item Circle: 32 copies of your left-hand item in a ring around you at waist height, about
+// 0.45 m apart (so 2.3 m out). 32 is as many as the queue holds; same limits as the duplicates.
+static void ItemCircle() {
+    Il2CppObject *head = g_head.get();
+    if (!head || !LeftHandItem()) return;
+    Vector3 hp = G.trGetPosition[head]();
+    const int count = 32;
+    const float radius = count * 0.45f / 6.2831853f;
+    std::vector<PendingItem> list;
+    for (int i = 0; i < count; i++) {
+        float a = i * 6.2831853f / count;
+        list.push_back({Vector3(hp.x + cosf(a) * radius, hp.y - 0.6f, hp.z + sinf(a) * radius), Vector3(0, 0, 0)});
+    }
+    double before = g_nextBatch;
+    QueueItems(list);
+    if (g_nextBatch != before) Notify("Item Circle!");
+}
+
+// Item Orbit: as many items as possible circle around you. The item in your left hand is let
+// go (the game's own drop) and 31 copies of it are spawned (32 is as many as the item queue
+// holds, with the same limits as the duplicates); each copy joins the orbit as soon as it
+// appears. They're spread evenly around a circle at chest height that gets bigger with more
+// items, bobbing and spinning. Their physics is paused while they orbit; turning Item Orbit off
+// gives it back, so they drop. Grabbing one takes just that one out of the orbit.
+static constexpr int kOrbitMax = 32;
+static Ref g_orbitItem[kOrbitMax], g_orbitRb[kOrbitMax];
+static int g_orbitN = 0;
+static float g_orbitAng = 0;
+static double g_orbitAdded[kOrbitMax];
+static Il2CppObject *ItemRigidbody(Il2CppObject *it) {
+    Il2CppObject *go = Alive(it) ? G.compGameObject[it]() : nullptr;
+    Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go](G.tRigidbody) : nullptr;
+    if (!rb && go && G.getComponentsInChildren.IsValid()) {
+        auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tRigidbody, true);
+        if (arr && *(uintptr_t *)(arr + 0x18) > 0) rb = ((Il2CppObject **)(arr + 0x20))[0];
+    }
+    return Alive(rb) ? rb : nullptr;
+}
+// Collision off while an item orbits (so dragging it through walls, the floor and you doesn't
+// make the game push it around), back on when it's let go.
+static void ItemCollision(Il2CppObject *it, bool on) {
+    Il2CppObject *go = Alive(it) ? G.compGameObject[it]() : nullptr;
+    if (!go || !G.tCollider || !G.colliderSetEnabled.IsValid() || !G.getComponentsInChildren.IsValid()) return;
+    auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tCollider, true);
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n && i < 16; i++) {
+        Il2CppObject *c = ((Il2CppObject **)(arr + 0x20))[i];
+        if (Alive(c)) G.colliderSetEnabled[c](on);
+    }
+}
+static void OrbitReleaseOne(int k) {                    // give item k its physics back and take it out
+    try { ItemCollision(g_orbitItem[k].get(), true); } catch (...) {}
+    Il2CppObject *rb = g_orbitRb[k].get();
+    if (Alive(rb)) {
+        if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](false);
+        if (G.rbSetUseGravity.IsValid()) G.rbSetUseGravity[rb](true);
+    }
+    g_orbitItem[k].clear(); g_orbitRb[k].clear();
+    for (int m = k; m + 1 < g_orbitN; m++) {            // close the gap (move the handles down)
+        g_orbitItem[m].h = g_orbitItem[m + 1].h; g_orbitRb[m].h = g_orbitRb[m + 1].h; g_orbitAdded[m] = g_orbitAdded[m + 1];
+    }
+    if (g_orbitN > 0) { g_orbitItem[g_orbitN - 1].h = nullptr; g_orbitRb[g_orbitN - 1].h = nullptr; g_orbitN--; }
+}
+static void OrbitRelease() {
+    while (g_orbitN > 0) { try { OrbitReleaseOne(g_orbitN - 1); } catch (...) { g_orbitItem[g_orbitN - 1].h = g_orbitRb[g_orbitN - 1].h = nullptr; g_orbitN--; } }
+    for (auto &w : g_dropWatch) w.until = 0;           // copies still on their way won't join
+}
+static void OrbitAdd(Il2CppObject *it) {
+    if (!f_itemOrbit || !Alive(it) || g_orbitN >= kOrbitMax) return;
+    for (int k = 0; k < g_orbitN; k++) if (g_orbitItem[k].get() == it) return;
+    int k = g_orbitN++;
+    g_orbitItem[k].set(it);
+    Il2CppObject *rb = ItemRigidbody(it);
+    if (rb) {
+        g_orbitRb[k].set(rb);
+        if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);   // we move it, not physics
+        G.rbSetVelocity[rb](Vector3(0, 0, 0));
+    }
+    try { ItemCollision(it, false); } catch (...) {}
+    g_orbitAdded[k] = g_time;
+}
+static bool OrbitHas(Il2CppObject *it) {
+    for (int k = 0; k < g_orbitN; k++) if (g_orbitItem[k].get() == it) return true;
+    return false;
+}
+static float OrbitRadius() { return std::max(1.0f, g_orbitN * 0.35f / 6.2831853f); }   // about 0.35 m between items
+static void ItemOrbitToggled() {
+    if (!f_itemOrbit) { OrbitRelease(); Notify("Item Orbit off"); return; }
+    Il2CppObject *head = g_head.get();
+    if (!head || !LeftHandItem() || !Alive(g_handItemObj)) { f_itemOrbit = false; g_dirty = true; return; }   // LeftHandItem said why
+    Il2CppObject *it = g_handItemObj;
+    try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}   // let go of it
+    OrbitAdd(it);
+    g_orbitAng = 0;
+    // 31 copies, spawned on the ring they'll orbit on; each joins once it appears
+    Vector3 hp = G.trGetPosition[head]();
+    float r = std::max(1.0f, kOrbitMax * 0.35f / 6.2831853f);
+    std::vector<PendingItem> list;
+    for (int i = 1; i < kOrbitMax; i++) {
+        float a = i * 6.2831853f / kOrbitMax;
+        PendingItem p{Vector3(hp.x + cosf(a) * r, hp.y - 0.35f, hp.z + sinf(a) * r), Vector3(0, 0, 0)};
+        p.orbit = true;
+        list.push_back(p);
+    }
+    double before = g_nextBatch;
+    QueueItems(list);                                     // (says "Wait a moment" if you spawned items just now)
+    Notify(g_nextBatch != before ? "Item Orbit on (adding copies...)" : "Item Orbit on (1 item, wait to add copies)");
+}
+static void ItemOrbitTick(float dt) {
+    if (!f_itemOrbit) { if (g_orbitN) OrbitRelease(); return; }   // switched off some other way
+    Il2CppObject *head = g_head.get();
+    if (!head) { f_itemOrbit = false; g_dirty = true; OrbitRelease(); return; }
+    // They keep spinning until you switch Item Orbit off. An item that's gone (despawned) is
+    // taken out. Nothing is sent to the room while they spin (only the one "let go" at the start).
+    for (int k = g_orbitN - 1; k >= 0; k--)
+        if (!Alive(g_orbitItem[k].get())) OrbitReleaseOne(k);
+    if (g_orbitN == 0) return;                          // nothing to spin right now (stays on until you switch it off)
+    g_orbitAng += 1.6f * dt;                             // about one lap every 4 seconds
+    if (g_orbitAng > 6.2831853f) g_orbitAng -= 6.2831853f;
+    Vector3 hp = G.trGetPosition[head]();
+    float r = OrbitRadius(), spin = (float)g_time * 3.0f;
+    Quaternion rot(0, sinf(spin * 0.5f), 0, cosf(spin * 0.5f));
+    for (int k = 0; k < g_orbitN; k++) {
+        float a = g_orbitAng + k * 6.2831853f / g_orbitN;
+        Vector3 pos(hp.x + cosf(a) * r, hp.y - 0.35f + 0.12f * sinf(a * 2.0f + (float)g_time), hp.z + sinf(a) * r);
+        Il2CppObject *t = G.compTransform[g_orbitItem[k].get()]();
+        G.trSetPosition[t](pos);
+        G.trSetRotation[t](rot);
+    }
+    static double nextRecheck = 0;                       // twice a second: keep physics paused if the game turned it back on
+    if (g_time >= nextRecheck) {
+        nextRecheck = g_time + 0.5;
+        for (int k = 0; k < g_orbitN; k++) {
+            Il2CppObject *rb = g_orbitRb[k].get();
+            if (Alive(rb) && G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);
+        }
+    }
+}
+
 // Spawn On Hand: each right-trigger press (grip open) spawns the item at your hand.
 static bool g_onHandTrigger = false;
+// Item Spawner: every Item the game has loaded (Resources.FindObjectsOfTypeAll also finds the
+// item prefabs that aren't in the room), one entry per item kind. Built when the page opens.
+static std::vector<std::string> g_seenKeys;               // every item kind seen this session (grows as you play)
+static void SeeKey(const std::string &key) {
+    if (key.empty() || key.size() >= 60 || g_seenKeys.size() >= 400) return;
+    for (auto &k : g_seenKeys) if (k == key) return;
+    g_seenKeys.push_back(key);
+}
+// Adds the kinds of all Items in an array; returns how many Items there were. A bad one
+// (e.g. a template that has no key until it's spawned) is skipped, not the whole list.
+static int CollectKeys(uint8_t *arr, int &errors) {
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(it)) continue;
+        try {
+            auto *k = G.itemKey[it]();
+            if (k) SeeKey(k->str());
+        } catch (...) { errors++; }
+    }
+    return (int)n;
+}
+// The game's full item list. A real item in the room is used to find where the game keeps item
+// names: each object the item points to (its item definition, usually) is checked for a text
+// field that holds exactly this item's name. When one matches, that kind of object and that
+// field are the game's item list: every loaded object of that kind gives one item name. Worked
+// out once (when there's an item around to check); read every time the page opens.
+static Ref g_defType;                                      // System.Type of the item definitions
+static int g_defOffset = -1, g_defCount = 0;
+static bool g_defFound = false;
+static std::string g_defName;
+struct Refl {
+    bool ok = false;
+    const char *(*className)(void *); void *(*getFields)(void *, void **); const char *(*fieldName)(void *);
+    const void *(*fieldType)(void *); int (*fieldFlags)(void *); size_t (*fieldOffset)(void *); int (*typeKind)(const void *);
+    void *(*getParent)(void *); const void *(*classType)(void *); Il2CppObject *(*typeObject)(const void *);
+    bool (*isSub)(void *, void *, bool);
+};
+static Refl &Reflection() {
+    static Refl r;
+    static bool tried = false;
+    if (tried) return r;
+    tried = true;
+    auto R = ym::api()->resolve;
+    r.className = (decltype(r.className))R("il2cpp_class_get_name");
+    r.getFields = (decltype(r.getFields))R("il2cpp_class_get_fields");
+    r.fieldName = (decltype(r.fieldName))R("il2cpp_field_get_name");
+    r.fieldType = (decltype(r.fieldType))R("il2cpp_field_get_type");
+    r.fieldFlags = (decltype(r.fieldFlags))R("il2cpp_field_get_flags");
+    r.fieldOffset = (decltype(r.fieldOffset))R("il2cpp_field_get_offset");
+    r.typeKind = (decltype(r.typeKind))R("il2cpp_type_get_type");
+    r.getParent = (decltype(r.getParent))R("il2cpp_class_get_parent");
+    r.classType = (decltype(r.classType))R("il2cpp_class_get_type");
+    r.typeObject = (decltype(r.typeObject))R("il2cpp_type_get_object");
+    r.isSub = (decltype(r.isSub))R("il2cpp_class_is_subclass_of");
+    r.ok = r.className && r.getFields && r.fieldName && r.fieldType && r.fieldFlags && r.fieldOffset && r.typeKind &&
+           r.getParent && r.classType && r.typeObject && r.isSub;
+    return r;
+}
+// Calls fn(offset) for every non-static field of kind `kind` on class k and its parents (up to stop).
+template <typename F> static void EachField(Refl &r, void *k, void *stop, int kind, F fn) {
+    for (int depth = 0; k && k != stop && depth < 8; depth++, k = r.getParent(k)) {
+        void *iter = nullptr;
+        while (void *f = r.getFields(k, &iter)) {
+            if (r.fieldFlags(f) & 0x10) continue;                          // static
+            if (r.typeKind(r.fieldType(f)) != kind) continue;
+            fn((int)r.fieldOffset(f));
+        }
+    }
+}
+static void FindItemDefinitions() {
+    if (g_defFound || !G.tItem || !G.itemKey.IsValid() || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return;
+    Refl &r = Reflection();
+    Class uobj("UnityEngine", "Object"), mono("UnityEngine", "MonoBehaviour");
+    if (!r.ok || !uobj.IsValid()) return;
+    void *uobjClass = uobj.GetClass(), *monoClass = mono.IsValid() ? (void *)mono.GetClass() : uobjClass;
+    auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem) : G.findSceneByType((Il2CppObject *)G.tItem, 0));
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n && i < 30 && !g_defFound; i++) {             // a few real items to check against
+        Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(it)) continue;
+        std::string key;
+        try { auto *k = G.itemKey[it](); key = k ? k->str() : ""; } catch (...) {}
+        if (key.empty()) continue;
+        // the objects this item points to (0x12 = a class reference)
+        EachField(r, it->klass, monoClass, 0x12, [&](int off) {
+            if (g_defFound) return;
+            Il2CppObject *def = *(Il2CppObject **)((uint8_t *)it + off);
+            if (!def || !def->klass || !r.isSub(def->klass, uobjClass, false)) return;   // only loaded Unity objects (assets)
+            // a text field on it (0x0e = string) holding exactly this item's name
+            EachField(r, def->klass, uobjClass, 0x0e, [&](int soff) {
+                if (g_defFound) return;
+                auto *str = *(BNM::Structures::Mono::String **)((uint8_t *)def + soff);
+                if (!str || str->str() != key) return;
+                Il2CppObject *t = r.typeObject(r.classType(def->klass));
+                if (!t) return;
+                g_defType.set(t);
+                g_defOffset = soff;
+                g_defName = r.className(def->klass) ? r.className(def->klass) : "?";
+                g_defFound = true;
+            });
+        });
+    }
+    if (g_defFound) ym::log("clientdabell: item list: the game's item names are in %s (field at %d)", g_defName.c_str(), g_defOffset);
+}
+static int ReadItemDefinitions() {
+    Il2CppObject *t = g_defType.get();
+    if (!g_defFound || !t || !G.findAll.IsValid()) return 0;
+    auto *arr = (uint8_t *)G.findAll(t);
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    int got = 0;
+    for (size_t i = 0; i < n && i < 2000; i++) {
+        Il2CppObject *d = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!d) continue;
+        auto *str = *(BNM::Structures::Mono::String **)((uint8_t *)d + g_defOffset);
+        if (str) { SeeKey(str->str()); got++; }
+    }
+    g_defCount = got;
+    return got;
+}
+// Game Finder: shows how Yeeps stores items and blocks, so the Item Spawner can list them all.
+// Only reads; nothing is spawned or sent. Lines:
+//   "I: name : type"   what's stored on an Item (and its parent classes)
+//   "N: name : type"   what's stored on the part that spawns items (NetworkMessenger)
+//   "L: Class xN"      game classes named like a list / database / catalog / prefab, and how many are loaded
+//   "B: Class xN"      game classes with "Block" in the name, and how many are loaded
+static void ScanBlocks() {
+    Refl &r = Reflection();
+    auto R = ym::api()->resolve;
+    auto getImage = (void *(*)(void *))R("il2cpp_class_get_image");
+    auto count = (size_t (*)(const void *))R("il2cpp_image_get_class_count");
+    auto getClass = (void *(*)(const void *, size_t))R("il2cpp_image_get_class");
+    auto typeName = (char *(*)(const void *))R("il2cpp_type_get_name");
+    auto freeMem = (void (*)(void *))R("il2cpp_free");
+    Class uobj("UnityEngine", "Object");
+    g_blockView.clear();
+    g_blockInfo.clear();
+    if (!r.ok || !getImage || !count || !getClass || !typeName || !uobj.IsValid() || !G.findAll.IsValid()) { Notify("Game Finder isn't available"); return; }
+    void *uobjClass = uobj.GetClass();
+    auto Add = [&](const std::string &line) {
+        if (g_blockInfo.size() >= 200) return;
+        g_blockInfo.push_back(line.size() > 90 ? line.substr(0, 90) : line);
+        ym::log("clientdabell: game finder: %s", g_blockInfo.back().c_str());
+    };
+    // A readable short type: drop "System.Collections.Generic." and "System." prefixes
+    auto Short = [](std::string t) {
+        for (const char *p : {"System.Collections.Generic.", "UnityEngine.", "System."})
+            for (size_t at; (at = t.find(p)) != std::string::npos;) t.erase(at, strlen(p));
+        return t;
+    };
+    // A field name: readable names as they are, scrambled ones cut to "#" plus 3 characters
+    // (scrambled names become "#" + the field's position in its class, which stays the same)
+    auto Name = [](const char *fn, int idx) {
+        std::string n = fn ? fn : "?";
+        bool plain = true;
+        for (unsigned char c : n) if (c > 126 || c < 32) { plain = false; break; }
+        return plain ? (n.size() > 28 ? n.substr(0, 28) : n) : std::string("#") + std::to_string(idx);
+    };
+    // Lists, tables and arrays of a class (only those: they're what an item list would be)
+    auto Collections = [&](const char *prefix, void *k) {
+        void *iter = nullptr;
+        int idx = -1;
+        while (void *f = r.getFields(k, &iter)) {
+            idx++;
+            int kind = r.typeKind(r.fieldType(f));
+            if (kind != 0x15 && kind != 0x1d) continue;            // generic (List/Dictionary/HashSet) or array
+            char *tn = typeName(r.fieldType(f));
+            std::string t = tn ? Short(tn) : "?";
+            if (tn && freeMem) freeMem(tn);
+            Add(std::string(prefix) + ((r.fieldFlags(f) & 0x10) ? "static " : "") + Name(r.fieldName(f), idx) + " : " + t);
+        }
+    };
+    Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
+    if (net.IsValid()) Collections("N: ", net.GetClass());
+    void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
+    void *image = itemClass ? getImage(itemClass) : nullptr;
+    size_t n = image ? count(image) : 0;
+    std::vector<std::pair<std::string, void *>> found;
+    for (size_t i = 0; i < n; i++) {
+        void *k = getClass(image, i);
+        const char *nm = k ? r.className(k) : nullptr;
+        if (!nm || !r.isSub(k, uobjClass, false)) continue;
+        bool want = false;
+        for (const char *w : {"Item", "Build", "Store", "Block", "Inventory", "Prefab", "Spawn", "Catalog", "Database", "Shop"})
+            want |= strstr(nm, w) != nullptr;
+        if (!want) continue;
+        Il2CppObject *t = r.typeObject(r.classType(k));
+        int loaded = 0;
+        if (t) { try { auto *arr = (uint8_t *)G.findAll(t); loaded = arr ? (int)*(uintptr_t *)(arr + 0x18) : 0; } catch (...) {} }
+        if (loaded == 0) continue;                                   // only parts that are actually loaded
+        found.push_back({std::string(nm) + " x" + std::to_string(loaded), k});
+    }
+    std::sort(found.begin(), found.end());
+    for (auto &fk : found) {
+        Add("C: " + fk.first);
+        Collections("   ", fk.second);
+    }
+    g_blockView.reserve(g_blockInfo.size());
+    for (auto &b : g_blockInfo) g_blockView.push_back({BLOCKS, b.c_str(), ACTION, MAIN, nullptr, nullptr});
+    g_page = 0;
+    Notify("%d lines, %d pages (send a video of all of them)", (int)g_blockInfo.size(), (int)(g_blockInfo.size() + 8) / 8);
+}
+
+static void ScanCatalog() {
+    if (!G.tItem || !G.itemKey.IsValid()) { Notify("Item list isn't available in this game"); return; }
+    int errors = 0, all = 0, room = 0;
+    if (G.findAll.IsValid()) {                            // everything loaded, templates included
+        try { all = CollectKeys((uint8_t *)G.findAll((Il2CppObject *)G.tItem), errors); } catch (...) { errors++; }
+    }
+    if (G.findScene.IsValid() || G.findSceneByType.IsValid()) {   // the items in this room
+        try {
+            room = CollectKeys((uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem)
+                                                                 : G.findSceneByType((Il2CppObject *)G.tItem, 0)), errors);
+        } catch (...) { errors++; }
+    }
+    if (g_itemKey[0]) SeeKey(g_itemKey);                 // the last item you held
+    int defs = 0;
+    try { FindItemDefinitions(); defs = ReadItemDefinitions(); } catch (...) { errors++; }
+    std::vector<std::string> keys = g_seenKeys;
+    std::sort(keys.begin(), keys.end());
+    g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
+    g_catalog = std::move(keys);
+    g_spawnView.reserve(g_catalog.size());
+    for (auto &k : g_catalog) g_spawnView.push_back({SPAWNER, k.c_str(), ACTION, MAIN, nullptr, SpawnPicked});
+    g_page = 0;
+    ym::log("clientdabell: item spawner: %d kinds (loaded=%d room=%d defs=%d in %s, errors=%d)", (int)g_catalog.size(), all, room,
+            defs, g_defFound ? g_defName.c_str() : "-", errors);
+    if (!g_defFound) Notify("%d items (reopen when there are items in the room for the full list)", (int)g_catalog.size());
+    else Notify("%d items", (int)g_catalog.size());
+}
+// Tapping an item in the list: one of it appears 80 cm in front of you. Same limits as
+// Spawn On Hand: one every 0.3 s, through the item queue (2 sent per frame, 32 waiting at most).
+static void SpawnPicked() {
+    Item *it = g_lastPressed;
+    Il2CppObject *head = g_head.get();
+    if (!it || !head || g_spawnView.empty() || it < &g_spawnView[0] || it > &g_spawnView.back()) return;
+    if (g_time < g_nextItem) return;
+    if (g_itemQueue.size() >= 32) { Notify("Wait a moment"); return; }
+    g_nextItem = g_time + 0.3;
+    snprintf(g_itemKey, sizeof g_itemKey, "%s", g_catalog[it - &g_spawnView[0]].c_str());
+    Vector3 f = G.trGetForward[head]();
+    g_itemQueue.push_back({G.trGetPosition[head]() + f * 0.8f + Vector3(0, -0.2f, 0), Vector3(0, 0, 0)});
+    Notify("Spawned %.40s", g_itemKey);
+}
+
 static void SpawnOnHandTick(const Buttons &in) {
     bool press = in.rtrig && !g_onHandTrigger;
     g_onHandTrigger = in.rtrig;
@@ -2595,6 +3195,166 @@ static void ApplyLoop() {
         if (!f_soundLoop) g_micUntil = g_time + g_clipLen + 0.5;     // at most one more play-through
     }
 }
+// ---- Disable Songs ------------------------------------------------------------------
+// Other players' songs come through their voice chat, so a song can't be told apart from
+// talking for sure. This guesses from how the sound behaves: talking has short pauses all the
+// time, music keeps going. Each other player's voice (Photon Voice's Speaker, and the
+// AudioSource it plays through) is measured 10 times a second. If it stays loud with no pause
+// for kSongSecs, they're muted for you (volume turned almost all the way down, so it can
+// still be measured). When it's quiet for kQuietSecs (the music stopped), their volume goes
+// back. Only your own game changes; nothing is sent.
+static constexpr int kMaxSpeakers = 16;
+static constexpr float kSongSecs = 5.0f, kQuietSecs = 1.0f, kPauseSecs = 0.3f, kLoud = 0.015f, kMutedVol = 0.02f;
+static struct SpeakerWatch { Ref src, go; float loudRun = 0, quietRun = 0, volBefore = 1; bool muted = false, byMute = false, muteBefore = false; } g_spk[kMaxSpeakers];
+// Mute or unmute every sound player on that player's voice object (the game can play a voice
+// through more than one, and keeps setting their volume, so the mute switch is used).
+static void SetVoiceMute(Il2CppObject *go, Il2CppObject *src, bool on) {
+    if (Alive(src)) G.asSetMute[src](on);
+    if (!go || !G.getComponentsInChildren.IsValid()) return;
+    auto *ca = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tAudioSource, true);
+    size_t n = ca ? *(uintptr_t *)(ca + 0x18) : 0;
+    for (size_t i = 0; i < n && i < 8; i++) {
+        Il2CppObject *a = ((Il2CppObject **)(ca + 0x20))[i];
+        if (Alive(a) && a != g_audioSrc.get()) G.asSetMute[a](on);
+    }
+}
+static int g_spkN = 0, g_spkFound = -1;           // voices being watched; Speakers in the scene
+static float g_spkMaxLevel = 0;                        // loudest voice since the last on-screen report
+static double g_nextSpkReport = 0;
+static Ref g_spkBuf;
+static double g_nextSpkFind = 0, g_nextSpkMeasure = 0;
+
+static void SpeakerUnmute(SpeakerWatch &w) {
+    Il2CppObject *src = w.src.get();
+    if (w.muted && w.byMute) SetVoiceMute(w.go.get(), src, w.muteBefore);   // back to how it was (you may have muted them yourself)
+    else if (w.muted && Alive(src) && G.asSetVolume.IsValid()) G.asSetVolume[src](w.volBefore);
+    w.muted = false;
+}
+static void DisableSongsReset() {                       // everyone back to normal
+    for (int i = 0; i < g_spkN; i++) { try { SpeakerUnmute(g_spk[i]); } catch (...) {} g_spk[i].src.clear(); g_spk[i].go.clear(); g_spk[i] = SpeakerWatch(); }
+    g_spkN = 0;
+    g_nextSpkFind = g_nextSpkMeasure = 0;
+}
+static void DisableSongsToggled() {
+    if (!f_disableSongs) DisableSongsReset();
+}
+// Look for other players' voices now and then (they come and go as players join and leave).
+static void FindSpeakers() {
+    if (!G.findScene.IsValid() && !G.findSceneByType.IsValid()) return;
+    auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tSpeaker)
+                                                  : G.findSceneByType((Il2CppObject *)G.tSpeaker, 0));
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    g_spkFound = (int)n;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppObject *sp = ((Il2CppObject **)(arr + 0x20))[i];
+        Il2CppObject *go = Alive(sp) ? G.compGameObject[sp]() : nullptr;
+        Il2CppObject *src = go ? G.goGetComponent[go](G.tAudioSource) : nullptr;
+        if (!Alive(src) && go && G.getComponentsInChildren.IsValid()) {       // on a child object
+            auto *ca = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tAudioSource, true);
+            if (ca && *(uintptr_t *)(ca + 0x18) > 0) src = ((Il2CppObject **)(ca + 0x20))[0];
+        }
+        if (!Alive(src) && go && G.trGetParent.IsValid()) {                   // or on the parent
+            Il2CppObject *pt = G.trGetParent[Tr(go)]();
+            Il2CppObject *pgo = pt ? G.compGameObject[pt]() : nullptr;
+            if (pgo) src = G.goGetComponent[pgo](G.tAudioSource);
+        }
+        if (!Alive(src) || src == g_audioSrc.get()) continue;
+        bool known = false;
+        for (int k = 0; k < g_spkN && !known; k++) known = g_spk[k].src.get() == src;
+        if (known || g_spkN >= kMaxSpeakers) continue;
+        g_spk[g_spkN] = SpeakerWatch();
+        g_spk[g_spkN].src.set(src);
+        g_spk[g_spkN].go.set(go);
+        g_spkN++;
+    }
+    for (int k = 0; k < g_spkN; ) {                    // forget players who left
+        if (Alive(g_spk[k].src.get())) { k++; continue; }
+        g_spk[k].src.clear(); g_spk[k].go.clear();      // free this one's handles, then move the last one here
+        g_spk[k] = g_spk[g_spkN - 1];
+        g_spk[g_spkN - 1] = SpeakerWatch();
+        g_spkN--;
+    }
+}
+static void DisableSongsTick() {
+    if (!f_disableSongs && g_spkN > 0) DisableSongsReset();   // switched off some other way (Turn Everything Off): unmute everyone
+    if (!f_disableSongs) return;
+    bool canClip = G.asGetClip.IsValid() && G.audioClipGetData.IsValid() && G.asGetTimeSamples.IsValid() && G.audioClipSamples.IsValid();
+    if (!G.tSpeaker || !(G.asGetOutputData.IsValid() || canClip) || !G.asSetVolume.IsValid() || !G.arrayNew || !G.floatClass) {
+        if (g_time >= g_nextSpkReport) {                 // log what's missing (once a minute)
+            g_nextSpkReport = g_time + 60.0;
+            ym::log("clientdabell: disable songs missing speaker=%d data=%d clip=%d vol=%d buf=%d", G.tSpeaker ? 1 : 0,
+                    G.asGetOutputData.IsValid() ? 1 : 0, canClip ? 1 : 0, G.asSetVolume.IsValid() ? 1 : 0, G.arrayNew && G.floatClass ? 1 : 0);
+        }
+        return;
+    }
+    if (g_time >= g_nextSpkFind) { g_nextSpkFind = g_time + 2.0; FindSpeakers(); }
+    if (g_time < g_nextSpkMeasure) return;
+    const float step = 0.1f;
+    g_nextSpkMeasure = g_time + step;
+    if (!g_spkBuf.get()) g_spkBuf.set((Il2CppObject *)G.arrayNew(G.floatClass, 1024));
+    Il2CppObject *buf = g_spkBuf.get();
+    if (!buf) return;
+    float *d = (float *)((uint8_t *)buf + 0x20);
+    for (int k = 0; k < g_spkN; k++) {
+        SpeakerWatch &w = g_spk[k];
+        Il2CppObject *src = w.src.get();
+        if (!Alive(src)) continue;
+        // How loud they are: the last 1024 samples of the clip Photon writes their voice into
+        // (before the volume, so muting doesn't change it), or else what the AudioSource plays.
+        bool fromClip = false;
+        if (G.asIsPlaying.IsValid() && !G.asIsPlaying[src]()) {   // their voice isn't playing at all: silent
+            w.quietRun += step;
+            if (w.quietRun >= kPauseSecs) w.loudRun = 0;
+            if (w.muted && w.quietRun >= kQuietSecs) { SpeakerUnmute(w); w.loudRun = 0; }
+            continue;
+        }
+        Il2CppObject *clip = canClip ? G.asGetClip[src]() : nullptr;
+        if (Alive(clip)) {
+            int len = G.audioClipSamples[clip]();
+            if (len > 2048) {
+                int pos = G.asGetTimeSamples[src]() - 1024;
+                if (pos < 0) pos += len;                 // GetData wraps past the end by itself
+                fromClip = G.audioClipGetData[clip](buf, pos);
+            }
+        }
+        if (!fromClip) {
+            if (!G.asGetOutputData.IsValid()) continue;
+            G.asGetOutputData[src](buf, 0);
+        }
+        double sum = 0;
+        for (int i = 0; i < 1024; i++) sum += d[i] * d[i];
+        float rms = sqrtf((float)(sum / 1024));
+        // AudioSource output is after the volume: while muted, scale back up to how loud they really are
+        float level = (w.muted && !w.byMute && !fromClip) ? rms / kMutedVol : rms;
+        if (level > g_spkMaxLevel) g_spkMaxLevel = level;
+        if (level > kLoud) { w.loudRun += step; w.quietRun = 0; }
+        else {
+            w.quietRun += step;
+            if (w.quietRun >= kPauseSecs) w.loudRun = 0;   // a pause: that's talking, not a song
+        }
+        if (!w.muted && w.loudRun >= kSongSecs) {
+            // The mute switch when we can still measure from the clip (it isn't affected by
+            // muting); else turn the volume down so it can still be measured.
+            w.byMute = fromClip && G.asSetMute.IsValid();
+            if (w.byMute) {
+                w.muteBefore = G.asGetMute.IsValid() && G.asGetMute[src]();
+                SetVoiceMute(w.go.get(), src, true);
+            } else {
+                w.volBefore = G.asGetVolume.IsValid() ? G.asGetVolume[src]() : 1.0f;
+                if (w.volBefore < kMutedVol * 2) w.volBefore = 1.0f;
+                G.asSetVolume[src](kMutedVol);
+            }
+            w.muted = true;
+            Notify("Muted a song");
+            ym::log("clientdabell: disable songs: muted speaker %d (level %.3f)", k, level);
+        } else if (w.muted) {
+            if (w.byMute) SetVoiceMute(w.go.get(), src, true);   // keep it muted if the game turns it back on
+            else G.asSetVolume[src](kMutedVol);                   // keep it down if the game turns it back up
+            if (w.quietRun >= kQuietSecs) { SpeakerUnmute(w); w.loudRun = 0; }
+        }
+    }
+}
+
 static void NextSoundVolume() {
     g_soundVol = (g_soundVol + 1) % 3;
     Il2CppObject *src = g_audioSrc.get();
@@ -3815,9 +4575,62 @@ static void OverpoweredReset() {                               // room change: t
     for (auto &r : g_ring) Kill(r);
 }
 
+// ---- saved settings ------------------------------------------------------------------
+// Your settings are kept in clientdabell_settings.txt next to the mod files (one "name=value"
+// per line), written whenever you press a button and read once when the game starts. Only
+// settings are saved, not mods (so nothing turns itself on when you join a room).
+static std::string SettingsPath() {
+    const char *base = ym::api()->modsDir;
+    return std::string(base ? base : ".") + "/clientdabell_settings.txt";
+}
+struct IntSetting { const char *name; int *v; int count; };
+struct BoolSetting { const char *name; bool *v; };
+static const IntSetting kIntSettings[] = {
+    {"theme", &g_theme, kThemeCount}, {"pointer", &g_pointerSpot, 4}, {"ironSpeed", &g_ironSpeed, 4},
+    {"carSpeed", &g_carSpeed, 3}, {"soundVolume", &g_soundVol, 3}, {"effectIntensity", &g_wxIntensity, 3},
+    {"armLength", &g_armScale, 4}, {"jumpPower", &g_jumpPower, 4},
+};
+static const BoolSetting kBoolSettings[] = {
+    {"rightHandMenu", &f_rightHand}, {"barkMode", &f_barkMode}, {"rainbowMenu", &f_rainbow}, {"colorBlindMode", &f_colorBlind},
+    {"showFps", &f_fps}, {"showClock", &f_clock}, {"notifications", &f_notify}, {"othersHearIt", &f_soundMic},
+};
+static std::string g_lastSaved;
+static void SaveSettings() {
+    std::string text = "# ClientDaBell settings\n";
+    for (auto &st : kIntSettings) text += std::string(st.name) + "=" + std::to_string(*st.v) + "\n";
+    for (auto &st : kBoolSettings) text += std::string(st.name) + "=" + (*st.v ? "1" : "0") + "\n";
+    if (text == g_lastSaved) return;                    // nothing changed: don't write
+    FILE *f = fopen(SettingsPath().c_str(), "w");
+    if (!f) { ym::log("clientdabell: couldn't save settings to %s", SettingsPath().c_str()); return; }
+    fputs(text.c_str(), f);
+    fclose(f);
+    g_lastSaved = text;
+}
+static void LoadSettings() {
+    FILE *f = fopen(SettingsPath().c_str(), "r");
+    if (!f) { ym::log("clientdabell: no saved settings yet"); return; }
+    char line[128];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq) continue;
+        *eq = 0;
+        int v = atoi(eq + 1);
+        for (auto &st : kIntSettings)
+            if (!strcmp(line, st.name) && v >= 0 && v < st.count) { *st.v = v; n++; }
+        for (auto &st : kBoolSettings)
+            if (!strcmp(line, st.name)) { *st.v = v != 0; n++; }
+    }
+    fclose(f);
+    ym::log("clientdabell: loaded %d saved settings", n);
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
+    for (int k = 0; k < kOrbitMax; k++) { g_orbitItem[k].clear(); g_orbitRb[k].clear(); }
+    g_orbitN = 0; f_itemOrbit = false;
+    try { DisableSongsReset(); } catch (...) {}
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
@@ -3847,6 +4660,11 @@ static void OnUpdate(float dt) {
     static double fpsStart = 0;
     if (g_time - fpsStart >= 1.0) { g_fps = (float)(g_frames / (g_time - fpsStart)); g_frames = 0; fpsStart = g_time; }
     if (!Lookups()) return;
+    static bool settingsLoaded = false;
+    if (!settingsLoaded) {                              // once: your saved settings, before the menu is built
+        settingsLoaded = true;
+        try { LoadSettings(); SaveSettings(); } catch (...) {}
+    }
     auto *player = (Il2CppObject *)ym::api()->localPlayer();
     if (!player) return;
     if (player != g_player.get()) {                 // first frame in this room
@@ -3859,16 +4677,40 @@ static void OnUpdate(float dt) {
         if (pgo) g_rigidbody.set(G.goGetComponent[pgo](G.tRigidbody));
     }
     if (!g_leftHand.get() || !g_rightHand.get() || !g_head.get()) return;
-    if (!g_built) BuildMenu();
+    if (g_rebuildMenu) RebuildMenuNow();
+    if (!g_built) {
+        SetLayout(f_barkMode);
+        BuildMenu();
+        if (g_rebuiltNote && g_built) {
+            g_rebuiltNote = false;
+            Notify(f_barkMode ? "Bark Mode on: press %s to open or close the menu" : "Bark Mode off: the menu is back on your hand", f_rightHand ? "B" : "Y");
+        }
+    }
 
     Buttons in = ReadButtons();
-    ShowMenu(f_rightHand ? in.b : in.y);
+    {
+        bool btn = f_rightHand ? in.b : in.y;
+        if (g_barkLayout) {                              // Bark Mode: a press opens the panel and it stays up; press again to close
+            static bool prevBtn = false;
+            if (btn && !prevBtn) g_barkOpen = !g_barkOpen;
+            prevBtn = btn;
+            ShowMenu(g_barkOpen);
+        } else {
+            g_barkOpen = false;
+            ShowMenu(btn);                               // hand menu: shown while you hold the button
+        }
+    }
     if (g_menuShown) {
-        PlaceMenu();
-        CheckPress();
-        if (g_dirty) RenderPage();
-        UpdateTitle();
-        AnimateMenu();
+        try {
+            PlaceMenu();
+            CheckPress();
+            if (g_dirty) RenderPage();
+            UpdateTitle();
+            AnimateMenu();
+        } catch (...) {                                  // never let one bad frame stop the menu
+            g_dirty = true;
+            ym::log("clientdabell: menu error (kept going)");
+        }
     }
     if (g_notifyUntil > 0 && g_time >= g_notifyUntil) { Show(g_notifyGo, false); g_notifyUntil = 0; }
     FlyTick(in, dt);
@@ -3884,8 +4726,12 @@ static void OnUpdate(float dt) {
     ApplyGravity();
     NoclipTick(in);
     TeleportGunTick(in);
+    try { ItemOrbitTick(dt); }
+    catch (...) { f_itemOrbit = false; try { OrbitRelease(); } catch (...) {} ym::log("clientdabell: item orbit error, turned off"); }
     try { SpawnOnHandTick(in); ItemQueueTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
+    try { DisableSongsTick(); }
+    catch (...) { f_disableSongs = false; try { DisableSongsReset(); } catch (...) {} ym::log("clientdabell: disable songs error, turned off"); }
     try { LoadTick(); SoundTick(); }
     catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
     try { WeatherTick(dt); }
