@@ -1255,6 +1255,7 @@ static void RebuildMenuNow() {
 
 static void ScanCatalog();
 static void ScanBlocks();
+static void SaveSettings();
 static void Press(Item *it) {
     g_lastPressed = it;
     switch (it->kind) {
@@ -1286,6 +1287,7 @@ static void Press(Item *it) {
     }
     g_dirty = true;
     ym::log("clientdabell: %s", it->label);
+    try { SaveSettings(); } catch (...) {}
 }
 
 // Which part of the menu the pointer touches: row 0..7, -1 = <, kRows = >, -2 = nothing.
@@ -2304,163 +2306,6 @@ template <typename F> static void EachField(Refl &r, void *k, void *stop, int ki
         }
     }
 }
-// The game's item tables. Yeeps keeps its full item list in lookup tables the spawner uses: a
-// table from item name to item (Dictionary<string, ...>) or a list of item templates (List<Item>,
-// Item[], GameObject lists). The whole game is searched once for fields of those kinds (static
-// ones, and ones on loaded objects). A table is only trusted if it holds at least one item name
-// that's already confirmed real (from an item that was in the room, held or spawned), so random
-// tables (colors, sounds...) never get in.
-struct TableSrc { void *field; int offset; bool isStatic; int kind; int typeIdx; };   // kind 1: name table, 2: item list
-static std::vector<TableSrc> g_tables;
-static Ref g_tableTypes[96];
-static int g_tableTypeN = 0, g_tablesUsed = 0;
-static bool g_tablesFound = false;
-static void FindItemTables() {
-    if (g_tablesFound) return;
-    g_tablesFound = true;
-    Refl &r = Reflection();
-    auto Rs = ym::api()->resolve;
-    auto getImage = (void *(*)(void *))Rs("il2cpp_class_get_image");
-    auto count = (size_t (*)(const void *))Rs("il2cpp_image_get_class_count");
-    auto getClass = (void *(*)(const void *, size_t))Rs("il2cpp_image_get_class");
-    auto typeName = (char *(*)(const void *))Rs("il2cpp_type_get_name");
-    auto freeMem = (void (*)(void *))Rs("il2cpp_free");
-    auto isGeneric = (bool (*)(void *))Rs("il2cpp_class_is_generic");
-    Class uobj("UnityEngine", "Object");
-    void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
-    if (!r.ok || !getImage || !count || !getClass || !typeName || !itemClass || !uobj.IsValid()) return;
-    void *image = getImage(itemClass);
-    size_t n = image ? count(image) : 0;
-    for (size_t i = 0; i < n && g_tables.size() < 200; i++) {
-        void *k = getClass(image, i);
-        if (!k || (isGeneric && isGeneric(k))) continue;
-        bool isUObj = r.isSub(k, uobj.GetClass(), false);
-        int typeIdx = -1;
-        void *iter = nullptr;
-        while (void *f = r.getFields(k, &iter)) {
-            bool st = (r.fieldFlags(f) & 0x10) != 0;
-            if (!st && !isUObj) continue;                     // instance fields only on objects we can find
-            int kindOf = r.typeKind(r.fieldType(f));
-            if (kindOf != 0x15 && kindOf != 0x1d) continue;   // generic (List/Dictionary) or array
-            char *tn = typeName(r.fieldType(f));
-            if (!tn) continue;
-            std::string t = tn;
-            if (freeMem) freeMem(tn);
-            int kind = 0;
-            bool itemish = t.find("Item>") != std::string::npos || t.find("GameObject>") != std::string::npos;
-            if (t.rfind("System.Collections.Generic.Dictionary<System.String,", 0) == 0) { if (itemish) kind = 1; }
-            else if (t.find("Item>") != std::string::npos || t.find("Item[]") != std::string::npos ||
-                     t.find("GameObject>") != std::string::npos || t.find("GameObject[]") != std::string::npos) kind = 2;
-            if (!kind) continue;
-            if (!st && typeIdx < 0) {                          // remember this class's type, to find its objects
-                if (g_tableTypeN >= 96) continue;
-                Il2CppObject *to = r.typeObject(r.classType(k));
-                if (!to) continue;
-                typeIdx = g_tableTypeN;
-                g_tableTypes[g_tableTypeN++].set(to);
-            }
-            g_tables.push_back({f, (int)r.fieldOffset(f), st, kind, st ? -1 : typeIdx});
-        }
-    }
-    ym::log("clientdabell: item tables: %d possible tables", (int)g_tables.size());
-}
-// Reads one collection object (a Dictionary<string,...>, List<...> or array) into names.
-// Arrays are checked first: only arrays of object references (or the dictionary's
-// {hash, next, key, value} entries of exactly 24 bytes) are read, never ones holding numbers.
-static void ReadCollection(Il2CppObject *col, int kind, std::vector<std::string> &out) {
-    Refl &r = Reflection();
-    if (!col || !col->klass) return;
-    static auto elemClass = (void *(*)(void *))ym::api()->resolve("il2cpp_class_get_element_class");
-    static auto isValue = (bool (*)(void *))ym::api()->resolve("il2cpp_class_is_valuetype");
-    static auto elemSize = (int (*)(void *))ym::api()->resolve("il2cpp_class_array_element_size");
-    if (!elemClass || !isValue || !elemSize) return;
-    auto RefArray = [&](uint8_t *a) {                       // an array of references (not of numbers or structs)
-        if (!a) return false;
-        void *ac = ((Il2CppObject *)a)->klass, *ec = ac ? elemClass(ac) : nullptr;
-        return ec && !isValue(ec) && elemSize(ac) == (int)sizeof(void *);
-    };
-    auto FieldOff = [&](const char *a, const char *b) {
-        for (void *c = col->klass; c; c = r.getParent(c)) {
-            void *iter = nullptr;
-            while (void *f = r.getFields(c, &iter)) {
-                const char *fn = r.fieldName(f);
-                if (fn && (!strcmp(fn, a) || !strcmp(fn, b))) return (int)r.fieldOffset(f);
-            }
-        }
-        return -1;
-    };
-    auto ItemName = [&](Il2CppObject *o) {
-        if (!o || !Alive(o)) return;
-        Il2CppObject *it = o;
-        if (G.tItem && G.goGetComponent.IsValid() && o->klass && r.className(o->klass) && !strcmp(r.className(o->klass), "GameObject"))
-            it = G.goGetComponent[o](G.tItem);                // a GameObject: its Item
-        if (!it || !it->klass) return;
-        static void *itemK = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
-        if (it->klass != itemK && !(itemK && r.isSub(it->klass, itemK, false))) return;   // only ask real Items their name
-        try { auto *k = G.itemKey[it](); if (k) out.push_back(k->str()); } catch (...) {}
-    };
-    if (kind == 1) {                                         // Dictionary<string, X>: the names are the keys
-        int eo = FieldOff("_entries", "entries"), co = FieldOff("_count", "count");
-        if (eo < 0) return;
-        auto *entries = *(uint8_t **)((uint8_t *)col + eo);
-        if (!entries || elemSize(((Il2CppObject *)entries)->klass) != 24) return;   // {int, int, string, reference} only
-        int cnt = co >= 0 ? *(int *)((uint8_t *)col + co) : 0;
-        size_t len = *(uintptr_t *)(entries + 0x18);
-        for (size_t i = 0; i < len && (int)i < cnt && i < 4000; i++) {
-            uint8_t *e = entries + 0x20 + i * 24;                // {int hash; int next; string key; X value}
-            auto *key = *(BNM::Structures::Mono::String **)(e + 8);
-            if (key) out.push_back(key->str());
-        }
-        return;
-    }
-    // List<X> (its _items array and _size) or X[]
-    uint8_t *arr = (uint8_t *)col;
-    size_t len;
-    int io = FieldOff("_items", "items");
-    if (io >= 0) {
-        int so = FieldOff("_size", "size");
-        arr = *(uint8_t **)((uint8_t *)col + io);
-        len = so >= 0 ? (size_t)*(int *)((uint8_t *)col + so) : (arr ? *(uintptr_t *)(arr + 0x18) : 0);
-    } else len = *(uintptr_t *)(arr + 0x18);
-    if (!RefArray(arr)) return;
-    for (size_t i = 0; i < len && i < 4000; i++) ItemName(((Il2CppObject **)(arr + 0x20))[i]);
-}
-static int ReadItemTables(int &errors) {
-    auto staticGet = (void (*)(void *, void *))ym::api()->resolve("il2cpp_field_static_get_value");
-    std::vector<std::string> confirmed = g_seenKeys;          // names already known to be real items
-    if (confirmed.empty()) return 0;
-    std::sort(confirmed.begin(), confirmed.end());
-    int added = 0;
-    g_tablesUsed = 0;
-    auto Try = [&](Il2CppObject *col, int kind) {
-        std::vector<std::string> names;
-        try { ReadCollection(col, kind, names); } catch (...) { errors++; return; }
-        bool trusted = false;
-        for (auto &nm : names) if (std::binary_search(confirmed.begin(), confirmed.end(), nm)) { trusted = true; break; }
-        if (!trusted) return;
-        g_tablesUsed++;
-        for (auto &nm : names) { size_t before = g_seenKeys.size(); SeeKey(nm); added += g_seenKeys.size() > before; }
-    };
-    for (auto &t : g_tables) {
-        if (t.isStatic) {
-            if (!staticGet) continue;
-            Il2CppObject *col = nullptr;
-            try { staticGet(t.field, &col); } catch (...) { errors++; continue; }
-            Try(col, t.kind);
-        } else {
-            Il2CppObject *type = t.typeIdx >= 0 ? g_tableTypes[t.typeIdx].get() : nullptr;
-            if (!type || !G.findAll.IsValid()) continue;
-            uint8_t *objs = nullptr;
-            try { objs = (uint8_t *)G.findAll(type); } catch (...) { errors++; continue; }
-            size_t n = objs ? *(uintptr_t *)(objs + 0x18) : 0;
-            for (size_t i = 0; i < n && i < 8; i++) {
-                Il2CppObject *o = ((Il2CppObject **)(objs + 0x20))[i];
-                if (o) Try(*(Il2CppObject **)((uint8_t *)o + t.offset), t.kind);
-            }
-        }
-    }
-    return added;
-}
 static void FindItemDefinitions() {
     if (g_defFound || !G.tItem || !G.itemKey.IsValid() || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return;
     Refl &r = Reflection();
@@ -2525,63 +2370,171 @@ static void ScanBlocks() {
     auto getClass = (void *(*)(const void *, size_t))R("il2cpp_image_get_class");
     auto typeName = (char *(*)(const void *))R("il2cpp_type_get_name");
     auto freeMem = (void (*)(void *))R("il2cpp_free");
-    Class uobj("UnityEngine", "Object"), mono("UnityEngine", "MonoBehaviour");
+    Class uobj("UnityEngine", "Object");
     g_blockView.clear();
     g_blockInfo.clear();
-    if (!r.ok || !getImage || !count || !getClass || !uobj.IsValid() || !G.findAll.IsValid()) { Notify("Game Finder isn't available"); return; }
-    void *uobjClass = uobj.GetClass(), *monoClass = mono.IsValid() ? (void *)mono.GetClass() : uobjClass;
-    auto Add = [&](const char *prefix, const std::string &text) {
-        if (g_blockInfo.size() >= 160) return;
-        std::string line = std::string(prefix) + text;
-        if (line.size() > 70) line.resize(70);
-        g_blockInfo.push_back(line);
-        ym::log("clientdabell: game finder: %s", line.c_str());
+    if (!r.ok || !getImage || !count || !getClass || !typeName || !uobj.IsValid() || !G.findAll.IsValid()) { Notify("Game Finder isn't available"); return; }
+    void *uobjClass = uobj.GetClass();
+    auto Add = [&](const std::string &line) {
+        if (g_blockInfo.size() >= 200) return;
+        g_blockInfo.push_back(line.size() > 90 ? line.substr(0, 90) : line);
+        ym::log("clientdabell: game finder: %s", g_blockInfo.back().c_str());
     };
-    auto Fields = [&](const char *prefix, void *k) {               // every field of a class and its parents, with its type
-        for (int depth = 0; k && k != monoClass && k != uobjClass && depth < 6; depth++, k = r.getParent(k)) {
-            void *iter = nullptr;
-            while (void *f = r.getFields(k, &iter)) {
-                const char *fn = r.fieldName(f);
-                char *tn = typeName ? typeName(r.fieldType(f)) : nullptr;
-                std::string t = tn ? tn : "?";
-                if (tn && freeMem) freeMem(tn);
-                size_t dot = t.rfind('.', t.find('<') == std::string::npos ? std::string::npos : t.find('<'));
-                if (dot != std::string::npos) t = t.substr(dot + 1);          // short type names
-                Add(prefix, std::string((r.fieldFlags(f) & 0x10) ? "static " : "") + (fn ? fn : "?") + " : " + t);
-            }
+    // A readable short type: drop "System.Collections.Generic." and "System." prefixes
+    auto Short = [](std::string t) {
+        for (const char *p : {"System.Collections.Generic.", "UnityEngine.", "System."})
+            for (size_t at; (at = t.find(p)) != std::string::npos;) t.erase(at, strlen(p));
+        return t;
+    };
+    // A field name: readable names as they are, scrambled ones cut to "#" plus 3 characters
+    // (scrambled names become "#" + the field's position in its class, which stays the same)
+    auto Name = [](const char *fn, int idx) {
+        std::string n = fn ? fn : "?";
+        bool plain = true;
+        for (unsigned char c : n) if (c > 126 || c < 32) { plain = false; break; }
+        return plain ? (n.size() > 28 ? n.substr(0, 28) : n) : std::string("#") + std::to_string(idx);
+    };
+    // Lists, tables and arrays of a class (only those: they're what an item list would be)
+    auto Collections = [&](const char *prefix, void *k) {
+        void *iter = nullptr;
+        int idx = -1;
+        while (void *f = r.getFields(k, &iter)) {
+            idx++;
+            int kind = r.typeKind(r.fieldType(f));
+            if (kind != 0x15 && kind != 0x1d) continue;            // generic (List/Dictionary/HashSet) or array
+            char *tn = typeName(r.fieldType(f));
+            std::string t = tn ? Short(tn) : "?";
+            if (tn && freeMem) freeMem(tn);
+            Add(std::string(prefix) + ((r.fieldFlags(f) & 0x10) ? "static " : "") + Name(r.fieldName(f), idx) + " : " + t);
         }
     };
-    void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
-    if (itemClass) Fields("I: ", itemClass);
     Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
-    if (net.IsValid()) Fields("N: ", net.GetClass());
+    if (net.IsValid()) Collections("N: ", net.GetClass());
+    void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
     void *image = itemClass ? getImage(itemClass) : nullptr;
     size_t n = image ? count(image) : 0;
-    std::vector<std::string> lists, blocks;
+    std::vector<std::pair<std::string, void *>> found;
     for (size_t i = 0; i < n; i++) {
         void *k = getClass(image, i);
         const char *nm = k ? r.className(k) : nullptr;
         if (!nm || !r.isSub(k, uobjClass, false)) continue;
-        bool isBlock = strstr(nm, "Block") || strstr(nm, "block");
-        bool isList = strstr(nm, "Catalog") || strstr(nm, "Database") || strstr(nm, "Registry") || strstr(nm, "Library") ||
-                      strstr(nm, "Prefab") || strstr(nm, "ItemData") || strstr(nm, "ItemDef") || strstr(nm, "ItemInfo") ||
-                      strstr(nm, "ItemList") || strstr(nm, "Manager") || strstr(nm, "Shop") || strstr(nm, "Store");
-        if (!isBlock && !isList) continue;
+        bool want = false;
+        for (const char *w : {"Item", "Build", "Store", "Block", "Inventory", "Prefab", "Spawn", "Catalog", "Database", "Shop"})
+            want |= strstr(nm, w) != nullptr;
+        if (!want) continue;
         Il2CppObject *t = r.typeObject(r.classType(k));
         int loaded = 0;
         if (t) { try { auto *arr = (uint8_t *)G.findAll(t); loaded = arr ? (int)*(uintptr_t *)(arr + 0x18) : 0; } catch (...) {} }
-        if (loaded == 0 && !isBlock) continue;                         // only list-like ones that are actually loaded
-        std::string line = std::string(nm) + " x" + std::to_string(loaded);
-        (isBlock ? blocks : lists).push_back(line);
+        if (loaded == 0) continue;                                   // only parts that are actually loaded
+        found.push_back({std::string(nm) + " x" + std::to_string(loaded), k});
     }
-    std::sort(lists.begin(), lists.end());
-    std::sort(blocks.begin(), blocks.end());
-    for (auto &l : lists) Add("L: ", l);
-    for (auto &b : blocks) Add("B: ", b);
+    std::sort(found.begin(), found.end());
+    for (auto &fk : found) {
+        Add("C: " + fk.first);
+        Collections("   ", fk.second);
+    }
     g_blockView.reserve(g_blockInfo.size());
     for (auto &b : g_blockInfo) g_blockView.push_back({BLOCKS, b.c_str(), ACTION, MAIN, nullptr, nullptr});
     g_page = 0;
     Notify("%d lines, %d pages (send a video of all of them)", (int)g_blockInfo.size(), (int)(g_blockInfo.size() + 8) / 8);
+}
+
+// The spawning part of the game (NetworkMessenger) keeps a few static lists: List<Item>,
+// List<String> and Dictionary<String, List<String>>. Only those are read, and only on that one
+// class, which the game is already using (so reading it can't start anything up). Each list is
+// checked first (only arrays of references are read, never numbers), and its names are only
+// used if it holds at least one item name already confirmed real.
+static int g_netListsUsed = 0;
+static int ReadNetLists() {
+    Refl &r = Reflection();
+    auto Rs = ym::api()->resolve;
+    auto staticGet = (void (*)(void *, void *))Rs("il2cpp_field_static_get_value");
+    auto typeName = (char *(*)(const void *))Rs("il2cpp_type_get_name");
+    auto freeMem = (void (*)(void *))Rs("il2cpp_free");
+    auto elemClass = (void *(*)(void *))Rs("il2cpp_class_get_element_class");
+    auto isValue = (bool (*)(void *))Rs("il2cpp_class_is_valuetype");
+    auto elemSize = (int (*)(void *))Rs("il2cpp_class_array_element_size");
+    Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
+    void *itemK = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
+    if (!r.ok || !staticGet || !typeName || !elemClass || !isValue || !elemSize || !net.IsValid() || !itemK) return 0;
+    if (!G.netLocal.IsValid() || !G.netLocal()) return 0;                 // only once the game has it running
+    std::vector<std::string> confirmed = g_seenKeys;
+    if (confirmed.empty()) return 0;
+    std::sort(confirmed.begin(), confirmed.end());
+    auto FieldOff = [&](Il2CppObject *o, const char *a, const char *b) {
+        for (void *c = o->klass; c; c = r.getParent(c)) {
+            void *iter = nullptr;
+            while (void *f = r.getFields(c, &iter)) {
+                const char *fn = r.fieldName(f);
+                if (fn && (!strcmp(fn, a) || !strcmp(fn, b))) return (int)r.fieldOffset(f);
+            }
+        }
+        return -1;
+    };
+    auto RefArray = [&](uint8_t *a) {                         // an array of references, not numbers
+        if (!a) return false;
+        void *ac = ((Il2CppObject *)a)->klass, *ec = ac ? elemClass(ac) : nullptr;
+        return ec && !isValue(ec) && elemSize(ac) == (int)sizeof(void *);
+    };
+    auto ListItems = [&](Il2CppObject *list, std::vector<Il2CppObject *> &out) {   // List<T>: its _items, _size
+        if (!list || !list->klass) return;
+        int io = FieldOff(list, "_items", "items"), so = FieldOff(list, "_size", "size");
+        if (io < 0 || so < 0) return;
+        uint8_t *arr = *(uint8_t **)((uint8_t *)list + io);
+        if (!RefArray(arr)) return;
+        int n = *(int *)((uint8_t *)list + so);
+        size_t len = *(uintptr_t *)(arr + 0x18);
+        for (int i = 0; i < n && (size_t)i < len && i < 4000; i++) out.push_back(((Il2CppObject **)(arr + 0x20))[i]);
+    };
+    auto Str = [](Il2CppObject *o, std::vector<std::string> &names) { if (o) names.push_back(((BNM::Structures::Mono::String *)o)->str()); };
+    int added = 0;
+    g_netListsUsed = 0;
+    void *iter = nullptr;
+    while (void *f = r.getFields(net.GetClass(), &iter)) {
+        if (!(r.fieldFlags(f) & 0x10)) continue;                          // static only
+        char *tn = typeName(r.fieldType(f));
+        std::string t = tn ? tn : "";
+        if (tn && freeMem) freeMem(tn);
+        int kind = 0;
+        if (t == "System.Collections.Generic.List<System.String>") kind = 1;
+        else if (t == "System.Collections.Generic.List<Item>") kind = 2;
+        else if (t == "System.Collections.Generic.Dictionary<System.String,System.Collections.Generic.List<System.String>>") kind = 3;
+        if (!kind) continue;
+        Il2CppObject *col = nullptr;
+        staticGet(f, &col);
+        if (!col || !col->klass) continue;
+        std::vector<std::string> names;
+        if (kind == 1) { std::vector<Il2CppObject *> v; ListItems(col, v); for (auto *o : v) Str(o, names); }
+        else if (kind == 2) {
+            std::vector<Il2CppObject *> v;
+            ListItems(col, v);
+            for (auto *o : v) {
+                if (!o || !o->klass || !(o->klass == itemK || r.isSub(o->klass, itemK, false))) continue;
+                try { auto *k = G.itemKey[o](); if (k) names.push_back(k->str()); } catch (...) {}
+            }
+        } else {                                                          // Dictionary<String, List<String>>: keys and lists
+            int eo = FieldOff(col, "_entries", "entries"), co = FieldOff(col, "_count", "count");
+            if (eo < 0) continue;
+            uint8_t *entries = *(uint8_t **)((uint8_t *)col + eo);
+            if (!entries || elemSize(((Il2CppObject *)entries)->klass) != 24) continue;
+            int cnt = co >= 0 ? *(int *)((uint8_t *)col + co) : 0;
+            size_t len = *(uintptr_t *)(entries + 0x18);
+            for (size_t i = 0; i < len && (int)i < cnt && i < 4000; i++) {
+                uint8_t *e = entries + 0x20 + i * 24;                    // {int hash; int next; string key; List value}
+                Str(*(Il2CppObject **)(e + 8), names);
+                std::vector<Il2CppObject *> v;
+                ListItems(*(Il2CppObject **)(e + 16), v);
+                for (auto *o : v) Str(o, names);
+            }
+        }
+        bool trusted = false;
+        for (auto &nm : names) if (std::binary_search(confirmed.begin(), confirmed.end(), nm)) { trusted = true; break; }
+        ym::log("clientdabell: item spawner: game list (%s) has %d names, %s", t.c_str(), (int)names.size(), trusted ? "used" : "not items");
+        if (!trusted) continue;
+        g_netListsUsed++;
+        for (auto &nm : names) { size_t before = g_seenKeys.size(); SeeKey(nm); added += g_seenKeys.size() > before; }
+    }
+    return added;
 }
 
 static void ScanCatalog() {
@@ -2597,9 +2550,9 @@ static void ScanCatalog() {
         } catch (...) { errors++; }
     }
     if (g_itemKey[0]) SeeKey(g_itemKey);                 // the last item you held
-    int defs = 0, fromTables = 0;
+    int defs = 0, fromNet = 0;
     try { FindItemDefinitions(); defs = ReadItemDefinitions(); } catch (...) { errors++; }
-    try { FindItemTables(); fromTables = ReadItemTables(errors); } catch (...) { errors++; }
+    try { fromNet = ReadNetLists(); } catch (...) { errors++; }
     std::vector<std::string> keys = g_seenKeys;
     std::sort(keys.begin(), keys.end());
     g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
@@ -2609,10 +2562,10 @@ static void ScanCatalog() {
     g_page = 0;
     ym::log("clientdabell: item spawner: %d kinds (loaded=%d room=%d defs=%d in %s, errors=%d)", (int)g_catalog.size(), all, room,
             defs, g_defFound ? g_defName.c_str() : "-", errors);
-    ym::log("clientdabell: item spawner: %d from %d tables (of %d)", fromTables, g_tablesUsed, (int)g_tables.size());
-    if (g_tablesUsed == 0 && !g_defFound)
-        Notify("%d items (spawn or hold one item, then reopen for the full list)", (int)g_catalog.size());
-    else Notify("%d items (tables=%d)", (int)g_catalog.size(), g_tablesUsed);
+    ym::log("clientdabell: item spawner: %d new from %d game lists", fromNet, g_netListsUsed);
+    if (g_seenKeys.empty() || (!g_defFound && g_netListsUsed == 0))
+        Notify("%d items (lists=%d; spawn or hold an item, then reopen)", (int)g_catalog.size(), g_netListsUsed);
+    else Notify("%d items (lists=%d)", (int)g_catalog.size(), g_netListsUsed);
 }
 // Tapping an item in the list: one of it appears 80 cm in front of you. Same limits as
 // Spawn On Hand: one every 0.3 s, through the item queue (2 sent per frame, 32 waiting at most).
@@ -4723,6 +4676,56 @@ static void OverpoweredReset() {                               // room change: t
     for (auto &r : g_ring) Kill(r);
 }
 
+// ---- saved settings ------------------------------------------------------------------
+// Your settings are kept in clientdabell_settings.txt next to the mod files (one "name=value"
+// per line), written whenever you press a button and read once when the game starts. Only
+// settings are saved, not mods (so nothing turns itself on when you join a room).
+static std::string SettingsPath() {
+    const char *base = ym::api()->modsDir;
+    return std::string(base ? base : ".") + "/clientdabell_settings.txt";
+}
+struct IntSetting { const char *name; int *v; int count; };
+struct BoolSetting { const char *name; bool *v; };
+static const IntSetting kIntSettings[] = {
+    {"theme", &g_theme, kThemeCount}, {"pointer", &g_pointerSpot, 4}, {"ironSpeed", &g_ironSpeed, 4},
+    {"carSpeed", &g_carSpeed, 3}, {"soundVolume", &g_soundVol, 3}, {"effectIntensity", &g_wxIntensity, 3},
+    {"armLength", &g_armScale, 4}, {"jumpPower", &g_jumpPower, 4},
+};
+static const BoolSetting kBoolSettings[] = {
+    {"rightHandMenu", &f_rightHand}, {"barkMode", &f_barkMode}, {"rainbowMenu", &f_rainbow}, {"colorBlindMode", &f_colorBlind},
+    {"showFps", &f_fps}, {"showClock", &f_clock}, {"notifications", &f_notify}, {"othersHearIt", &f_soundMic},
+};
+static std::string g_lastSaved;
+static void SaveSettings() {
+    std::string text = "# ClientDaBell settings\n";
+    for (auto &st : kIntSettings) text += std::string(st.name) + "=" + std::to_string(*st.v) + "\n";
+    for (auto &st : kBoolSettings) text += std::string(st.name) + "=" + (*st.v ? "1" : "0") + "\n";
+    if (text == g_lastSaved) return;                    // nothing changed: don't write
+    FILE *f = fopen(SettingsPath().c_str(), "w");
+    if (!f) { ym::log("clientdabell: couldn't save settings to %s", SettingsPath().c_str()); return; }
+    fputs(text.c_str(), f);
+    fclose(f);
+    g_lastSaved = text;
+}
+static void LoadSettings() {
+    FILE *f = fopen(SettingsPath().c_str(), "r");
+    if (!f) { ym::log("clientdabell: no saved settings yet"); return; }
+    char line[128];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq) continue;
+        *eq = 0;
+        int v = atoi(eq + 1);
+        for (auto &st : kIntSettings)
+            if (!strcmp(line, st.name) && v >= 0 && v < st.count) { *st.v = v; n++; }
+        for (auto &st : kBoolSettings)
+            if (!strcmp(line, st.name)) { *st.v = v != 0; n++; }
+    }
+    fclose(f);
+    ym::log("clientdabell: loaded %d saved settings", n);
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
@@ -4758,6 +4761,11 @@ static void OnUpdate(float dt) {
     static double fpsStart = 0;
     if (g_time - fpsStart >= 1.0) { g_fps = (float)(g_frames / (g_time - fpsStart)); g_frames = 0; fpsStart = g_time; }
     if (!Lookups()) return;
+    static bool settingsLoaded = false;
+    if (!settingsLoaded) {                              // once: your saved settings, before the menu is built
+        settingsLoaded = true;
+        try { LoadSettings(); SaveSettings(); } catch (...) {}
+    }
     auto *player = (Il2CppObject *)ym::api()->localPlayer();
     if (!player) return;
     if (player != g_player.get()) {                 // first frame in this room
