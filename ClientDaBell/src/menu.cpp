@@ -529,7 +529,7 @@ static void NextWeatherIntensity();
 static void TodPicked();
 
 enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, SPAWNER, BLOCKS, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers", "Item Spawner", "Block Finder"};
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers", "Item Spawner", "Game Finder"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -595,7 +595,7 @@ static Item g_items[] = {
 
     {ITEMS, "Exit Items", OPEN, MAIN},
     {ITEMS, "Item Spawner", OPEN, SPAWNER},
-    {ITEMS, "Block Finder", OPEN, BLOCKS},
+    {ITEMS, "Game Finder", OPEN, BLOCKS},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
@@ -677,7 +677,7 @@ static Item g_spawnExit = {SPAWNER, "Exit Item Spawner", OPEN, ITEMS};
 // Block Finder: every kind of game object with "Block" in its name, and how many are loaded.
 static std::vector<std::string> g_blockInfo;
 static std::vector<Item> g_blockView;
-static Item g_blockExit = {BLOCKS, "Exit Block Finder", OPEN, ITEMS};
+static Item g_blockExit = {BLOCKS, "Exit Game Finder", OPEN, ITEMS};
 static Item *g_lastPressed = nullptr;                   // the button being pressed right now (for SpawnPicked)
 static bool f_modsPaused = false;               // Enabled Mods -> Disable All Mods is on: the mods that were on are saved here
 static std::vector<Item *> g_pausedMods;
@@ -725,7 +725,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
     {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
-    {"Block Finder", "Lists how the game makes blocks (for adding block spawning). Send a picture of it."},
+    {"Game Finder", "Shows how the game stores items and blocks (for the full item list). Send a video of all its pages."},
     {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
@@ -2354,39 +2354,77 @@ static int ReadItemDefinitions() {
     g_defCount = got;
     return got;
 }
-// Block Finder: goes through the game's own classes (Assembly-CSharp) for ones with "Block" in
-// the name that are Unity objects, and counts how many of each are loaded. Only reads; nothing
-// is spawned or sent. It's there to show how Yeeps makes blocks, so block spawning can be added.
+// Game Finder: shows how Yeeps stores items and blocks, so the Item Spawner can list them all.
+// Only reads; nothing is spawned or sent. Lines:
+//   "I: name : type"   what's stored on an Item (and its parent classes)
+//   "N: name : type"   what's stored on the part that spawns items (NetworkMessenger)
+//   "L: Class xN"      game classes named like a list / database / catalog / prefab, and how many are loaded
+//   "B: Class xN"      game classes with "Block" in the name, and how many are loaded
 static void ScanBlocks() {
     Refl &r = Reflection();
     auto R = ym::api()->resolve;
     auto getImage = (void *(*)(void *))R("il2cpp_class_get_image");
     auto count = (size_t (*)(const void *))R("il2cpp_image_get_class_count");
     auto getClass = (void *(*)(const void *, size_t))R("il2cpp_image_get_class");
-    Class uobj("UnityEngine", "Object");
+    auto typeName = (char *(*)(const void *))R("il2cpp_type_get_name");
+    auto freeMem = (void (*)(void *))R("il2cpp_free");
+    Class uobj("UnityEngine", "Object"), mono("UnityEngine", "MonoBehaviour");
     g_blockView.clear();
     g_blockInfo.clear();
-    if (!r.ok || !getImage || !count || !getClass || !uobj.IsValid() || !G.findAll.IsValid()) { Notify("Block Finder isn't available"); return; }
+    if (!r.ok || !getImage || !count || !getClass || !uobj.IsValid() || !G.findAll.IsValid()) { Notify("Game Finder isn't available"); return; }
+    void *uobjClass = uobj.GetClass(), *monoClass = mono.IsValid() ? (void *)mono.GetClass() : uobjClass;
+    auto Add = [&](const char *prefix, const std::string &text) {
+        if (g_blockInfo.size() >= 160) return;
+        std::string line = std::string(prefix) + text;
+        if (line.size() > 70) line.resize(70);
+        g_blockInfo.push_back(line);
+        ym::log("clientdabell: game finder: %s", line.c_str());
+    };
+    auto Fields = [&](const char *prefix, void *k) {               // every field of a class and its parents, with its type
+        for (int depth = 0; k && k != monoClass && k != uobjClass && depth < 6; depth++, k = r.getParent(k)) {
+            void *iter = nullptr;
+            while (void *f = r.getFields(k, &iter)) {
+                const char *fn = r.fieldName(f);
+                char *tn = typeName ? typeName(r.fieldType(f)) : nullptr;
+                std::string t = tn ? tn : "?";
+                if (tn && freeMem) freeMem(tn);
+                size_t dot = t.rfind('.', t.find('<') == std::string::npos ? std::string::npos : t.find('<'));
+                if (dot != std::string::npos) t = t.substr(dot + 1);          // short type names
+                Add(prefix, std::string((r.fieldFlags(f) & 0x10) ? "static " : "") + (fn ? fn : "?") + " : " + t);
+            }
+        }
+    };
     void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
+    if (itemClass) Fields("I: ", itemClass);
+    Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
+    if (net.IsValid()) Fields("N: ", net.GetClass());
     void *image = itemClass ? getImage(itemClass) : nullptr;
     size_t n = image ? count(image) : 0;
-    for (size_t i = 0; i < n && g_blockInfo.size() < 64; i++) {
+    std::vector<std::string> lists, blocks;
+    for (size_t i = 0; i < n; i++) {
         void *k = getClass(image, i);
         const char *nm = k ? r.className(k) : nullptr;
-        if (!nm || !(strstr(nm, "Block") || strstr(nm, "block")) || !r.isSub(k, uobj.GetClass(), false)) continue;
+        if (!nm || !r.isSub(k, uobjClass, false)) continue;
+        bool isBlock = strstr(nm, "Block") || strstr(nm, "block");
+        bool isList = strstr(nm, "Catalog") || strstr(nm, "Database") || strstr(nm, "Registry") || strstr(nm, "Library") ||
+                      strstr(nm, "Prefab") || strstr(nm, "ItemData") || strstr(nm, "ItemDef") || strstr(nm, "ItemInfo") ||
+                      strstr(nm, "ItemList") || strstr(nm, "Manager") || strstr(nm, "Shop") || strstr(nm, "Store");
+        if (!isBlock && !isList) continue;
         Il2CppObject *t = r.typeObject(r.classType(k));
         int loaded = 0;
         if (t) { try { auto *arr = (uint8_t *)G.findAll(t); loaded = arr ? (int)*(uintptr_t *)(arr + 0x18) : 0; } catch (...) {} }
-        char line[80];
-        snprintf(line, sizeof line, "%.50s x%d", nm, loaded);
-        g_blockInfo.push_back(line);
-        ym::log("clientdabell: block finder: %s", line);
+        if (loaded == 0 && !isBlock) continue;                         // only list-like ones that are actually loaded
+        std::string line = std::string(nm) + " x" + std::to_string(loaded);
+        (isBlock ? blocks : lists).push_back(line);
     }
-    std::sort(g_blockInfo.begin(), g_blockInfo.end());
+    std::sort(lists.begin(), lists.end());
+    std::sort(blocks.begin(), blocks.end());
+    for (auto &l : lists) Add("L: ", l);
+    for (auto &b : blocks) Add("B: ", b);
     g_blockView.reserve(g_blockInfo.size());
     for (auto &b : g_blockInfo) g_blockView.push_back({BLOCKS, b.c_str(), ACTION, MAIN, nullptr, nullptr});
     g_page = 0;
-    Notify(g_blockInfo.empty() ? "No block types found" : "%d block types (send a picture)", (int)g_blockInfo.size());
+    Notify("%d lines, %d pages (send a video of all of them)", (int)g_blockInfo.size(), (int)(g_blockInfo.size() + 8) / 8);
 }
 
 static void ScanCatalog() {
