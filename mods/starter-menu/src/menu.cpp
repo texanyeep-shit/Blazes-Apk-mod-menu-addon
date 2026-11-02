@@ -2240,7 +2240,7 @@ static bool g_onHandTrigger = false;
 // item prefabs that aren't in the room), one entry per item kind. Built when the page opens.
 static std::vector<std::string> g_seenKeys;               // every item kind seen this session (grows as you play)
 static void SeeKey(const std::string &key) {
-    if (key.empty() || key.size() >= 60 || g_seenKeys.size() >= 400) return;
+    if (key.empty() || key.size() >= 60 || g_seenKeys.size() >= 1000) return;
     for (auto &k : g_seenKeys) if (k == key) return;
     g_seenKeys.push_back(key);
 }
@@ -2439,6 +2439,104 @@ static void ScanBlocks() {
     Notify("%d lines, %d pages (send a video of all of them)", (int)g_blockInfo.size(), (int)(g_blockInfo.size() + 8) / 8);
 }
 
+// The spawning part of the game (NetworkMessenger) keeps a few static lists: List<Item>,
+// List<String> and Dictionary<String, List<String>>. Only those are read, and only on that one
+// class, which the game is already using (so reading it can't start anything up). Each list is
+// checked first (only arrays of references are read, never numbers), and its names are only
+// used if it holds at least one item name already confirmed real.
+static int g_netListsUsed = 0;
+static int ReadNetLists() {
+    Refl &r = Reflection();
+    auto Rs = ym::api()->resolve;
+    auto staticGet = (void (*)(void *, void *))Rs("il2cpp_field_static_get_value");
+    auto typeName = (char *(*)(const void *))Rs("il2cpp_type_get_name");
+    auto freeMem = (void (*)(void *))Rs("il2cpp_free");
+    auto elemClass = (void *(*)(void *))Rs("il2cpp_class_get_element_class");
+    auto isValue = (bool (*)(void *))Rs("il2cpp_class_is_valuetype");
+    auto elemSize = (int (*)(void *))Rs("il2cpp_class_array_element_size");
+    Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
+    void *itemK = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
+    if (!r.ok || !staticGet || !typeName || !elemClass || !isValue || !elemSize || !net.IsValid() || !itemK) return 0;
+    if (!G.netLocal.IsValid() || !G.netLocal()) return 0;                 // only once the game has it running
+    std::vector<std::string> confirmed = g_seenKeys;
+    if (confirmed.empty()) return 0;
+    std::sort(confirmed.begin(), confirmed.end());
+    auto FieldOff = [&](Il2CppObject *o, const char *a, const char *b) {
+        for (void *c = o->klass; c; c = r.getParent(c)) {
+            void *iter = nullptr;
+            while (void *f = r.getFields(c, &iter)) {
+                const char *fn = r.fieldName(f);
+                if (fn && (!strcmp(fn, a) || !strcmp(fn, b))) return (int)r.fieldOffset(f);
+            }
+        }
+        return -1;
+    };
+    auto RefArray = [&](uint8_t *a) {                         // an array of references, not numbers
+        if (!a) return false;
+        void *ac = ((Il2CppObject *)a)->klass, *ec = ac ? elemClass(ac) : nullptr;
+        return ec && !isValue(ec) && elemSize(ac) == (int)sizeof(void *);
+    };
+    auto ListItems = [&](Il2CppObject *list, std::vector<Il2CppObject *> &out) {   // List<T>: its _items, _size
+        if (!list || !list->klass) return;
+        int io = FieldOff(list, "_items", "items"), so = FieldOff(list, "_size", "size");
+        if (io < 0 || so < 0) return;
+        uint8_t *arr = *(uint8_t **)((uint8_t *)list + io);
+        if (!RefArray(arr)) return;
+        int n = *(int *)((uint8_t *)list + so);
+        size_t len = *(uintptr_t *)(arr + 0x18);
+        for (int i = 0; i < n && (size_t)i < len && i < 4000; i++) out.push_back(((Il2CppObject **)(arr + 0x20))[i]);
+    };
+    auto Str = [](Il2CppObject *o, std::vector<std::string> &names) { if (o) names.push_back(((BNM::Structures::Mono::String *)o)->str()); };
+    int added = 0;
+    g_netListsUsed = 0;
+    void *iter = nullptr;
+    while (void *f = r.getFields(net.GetClass(), &iter)) {
+        if (!(r.fieldFlags(f) & 0x10)) continue;                          // static only
+        char *tn = typeName(r.fieldType(f));
+        std::string t = tn ? tn : "";
+        if (tn && freeMem) freeMem(tn);
+        int kind = 0;
+        if (t == "System.Collections.Generic.List<System.String>") kind = 1;
+        else if (t == "System.Collections.Generic.List<Item>") kind = 2;
+        else if (t == "System.Collections.Generic.Dictionary<System.String,System.Collections.Generic.List<System.String>>") kind = 3;
+        if (!kind) continue;
+        Il2CppObject *col = nullptr;
+        staticGet(f, &col);
+        if (!col || !col->klass) continue;
+        std::vector<std::string> names;
+        if (kind == 1) { std::vector<Il2CppObject *> v; ListItems(col, v); for (auto *o : v) Str(o, names); }
+        else if (kind == 2) {
+            std::vector<Il2CppObject *> v;
+            ListItems(col, v);
+            for (auto *o : v) {
+                if (!o || !o->klass || !(o->klass == itemK || r.isSub(o->klass, itemK, false))) continue;
+                try { auto *k = G.itemKey[o](); if (k) names.push_back(k->str()); } catch (...) {}
+            }
+        } else {                                                          // Dictionary<String, List<String>>: keys and lists
+            int eo = FieldOff(col, "_entries", "entries"), co = FieldOff(col, "_count", "count");
+            if (eo < 0) continue;
+            uint8_t *entries = *(uint8_t **)((uint8_t *)col + eo);
+            if (!entries || elemSize(((Il2CppObject *)entries)->klass) != 24) continue;
+            int cnt = co >= 0 ? *(int *)((uint8_t *)col + co) : 0;
+            size_t len = *(uintptr_t *)(entries + 0x18);
+            for (size_t i = 0; i < len && (int)i < cnt && i < 4000; i++) {
+                uint8_t *e = entries + 0x20 + i * 24;                    // {int hash; int next; string key; List value}
+                Str(*(Il2CppObject **)(e + 8), names);
+                std::vector<Il2CppObject *> v;
+                ListItems(*(Il2CppObject **)(e + 16), v);
+                for (auto *o : v) Str(o, names);
+            }
+        }
+        bool trusted = false;
+        for (auto &nm : names) if (std::binary_search(confirmed.begin(), confirmed.end(), nm)) { trusted = true; break; }
+        ym::log("clientdabell: item spawner: game list (%s) has %d names, %s", t.c_str(), (int)names.size(), trusted ? "used" : "not items");
+        if (!trusted) continue;
+        g_netListsUsed++;
+        for (auto &nm : names) { size_t before = g_seenKeys.size(); SeeKey(nm); added += g_seenKeys.size() > before; }
+    }
+    return added;
+}
+
 static void ScanCatalog() {
     if (!G.tItem || !G.itemKey.IsValid()) { Notify("Item list isn't available in this game"); return; }
     int errors = 0, all = 0, room = 0;
@@ -2452,8 +2550,9 @@ static void ScanCatalog() {
         } catch (...) { errors++; }
     }
     if (g_itemKey[0]) SeeKey(g_itemKey);                 // the last item you held
-    int defs = 0;
+    int defs = 0, fromNet = 0;
     try { FindItemDefinitions(); defs = ReadItemDefinitions(); } catch (...) { errors++; }
+    try { fromNet = ReadNetLists(); } catch (...) { errors++; }
     std::vector<std::string> keys = g_seenKeys;
     std::sort(keys.begin(), keys.end());
     g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
@@ -2463,8 +2562,10 @@ static void ScanCatalog() {
     g_page = 0;
     ym::log("clientdabell: item spawner: %d kinds (loaded=%d room=%d defs=%d in %s, errors=%d)", (int)g_catalog.size(), all, room,
             defs, g_defFound ? g_defName.c_str() : "-", errors);
-    if (!g_defFound) Notify("%d items (reopen when there are items in the room for the full list)", (int)g_catalog.size());
-    else Notify("%d items", (int)g_catalog.size());
+    ym::log("clientdabell: item spawner: %d new from %d game lists", fromNet, g_netListsUsed);
+    if (g_seenKeys.empty() || (!g_defFound && g_netListsUsed == 0))
+        Notify("%d items (lists=%d; spawn or hold an item, then reopen)", (int)g_catalog.size(), g_netListsUsed);
+    else Notify("%d items (lists=%d)", (int)g_catalog.size(), g_netListsUsed);
 }
 // Tapping an item in the list: one of it appears 80 cm in front of you. Same limits as
 // Spawn On Hand: one every 0.3 s, through the item queue (2 sent per frame, 32 waiting at most).
