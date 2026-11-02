@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v.1.2.7 Patch #1"
+#define CDB_VERSION "v.1.2.8"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -528,8 +528,8 @@ static void OverpoweredOff();
 static void NextWeatherIntensity();
 static void TodPicked();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, SPAWNER, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers", "Item Spawner"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -594,6 +594,7 @@ static Item g_items[] = {
     {RIG, "Beyblade", TOGGLE, MAIN, &g_danceSel[7], DancePicked},
 
     {ITEMS, "Exit Items", OPEN, MAIN},
+    {ITEMS, "Item Spawner", OPEN, SPAWNER},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
@@ -667,6 +668,12 @@ static Item g_items[] = {
 static constexpr int kItems = sizeof(g_items) / sizeof(g_items[0]);
 static Item g_returnItem = {ENABLED, "Exit Enabled Mods", OPEN, MAIN};
 static void DisableAllMods();
+// Item Spawner: a list built from the game's own items (every item kind it has loaded).
+static std::vector<std::string> g_catalog;              // item kinds (their keys), sorted
+static std::vector<Item> g_spawnView;                    // one button per kind (labels point into g_catalog)
+static void SpawnPicked();
+static Item g_spawnExit = {SPAWNER, "Exit Item Spawner", OPEN, ITEMS};
+static Item *g_lastPressed = nullptr;                   // the button being pressed right now (for SpawnPicked)
 static bool f_modsPaused = false;               // Enabled Mods -> Disable All Mods is on: the mods that were on are saved here
 static std::vector<Item *> g_pausedMods;
 static Item g_disableAllItem = {ENABLED, "Disable All Mods", TOGGLE, MAIN, &f_modsPaused, DisableAllMods};
@@ -713,6 +720,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
     {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
+    {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
@@ -869,7 +877,10 @@ static void DisableAllMods() {
 
 static void BuildView() {
     g_view.clear();
-    if (g_cat == ENABLED) {
+    if (g_cat == SPAWNER) {
+        g_view.push_back(&g_spawnExit);
+        for (auto &it : g_spawnView) g_view.push_back(&it);
+    } else if (g_cat == ENABLED) {
         g_view.push_back(&g_returnItem);
         bool any = f_modsPaused;                          // the switch stays while mods are saved
         for (auto &it : g_items) any |= ListedAsMod(it);
@@ -1233,7 +1244,9 @@ static void RebuildMenuNow() {
     SetLayout(f_barkMode);
 }
 
+static void ScanCatalog();
 static void Press(Item *it) {
+    g_lastPressed = it;
     switch (it->kind) {
     // A button's own code is run inside a safety net: if it fails, that switch goes back off and
     // you get a message, instead of the error stopping the whole menu.
@@ -1241,6 +1254,7 @@ static void Press(Item *it) {
         g_cat = it->target;
         g_page = 0;
         if (it->target == SOUNDBOARD) { try { ScanSongs(); } catch (...) { ym::log("clientdabell: song scan error"); } }
+        if (it->target == SPAWNER) { try { ScanCatalog(); } catch (...) { ym::log("clientdabell: item list error"); } }
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
@@ -2023,6 +2037,7 @@ static void SpawnGrid(int count) { SpawnGridDims(3, 3, count > 9 ? 3 : 1); }   /
 // The item you're holding in your LEFT hand right now (owner 2026-10-31: items spawn as
 // whatever is in your left hand when you press). One scene search per press.
 static Il2CppObject *g_handItemObj = nullptr;   // the item LeftHandItem just found (use right away only)
+static void SeeKey(const std::string &key);
 static bool LeftHandItem() {
     g_handItemObj = nullptr;
     Il2CppObject *hand = g_leftHand.get();
@@ -2043,6 +2058,7 @@ static bool LeftHandItem() {
     auto *key = best ? G.itemKey[best]() : nullptr;
     if (!key) { Notify("Hold an item in your left hand"); return false; }
     snprintf(g_itemKey, sizeof g_itemKey, "%s", key->str().c_str());
+    SeeKey(g_itemKey);
     g_handItemObj = best;
     return true;
 }
@@ -2207,6 +2223,160 @@ static void ItemOrbitTick(float dt) {
 
 // Spawn On Hand: each right-trigger press (grip open) spawns the item at your hand.
 static bool g_onHandTrigger = false;
+// Item Spawner: every Item the game has loaded (Resources.FindObjectsOfTypeAll also finds the
+// item prefabs that aren't in the room), one entry per item kind. Built when the page opens.
+static std::vector<std::string> g_seenKeys;               // every item kind seen this session (grows as you play)
+static void SeeKey(const std::string &key) {
+    if (key.empty() || key.size() >= 60 || g_seenKeys.size() >= 400) return;
+    for (auto &k : g_seenKeys) if (k == key) return;
+    g_seenKeys.push_back(key);
+}
+// Adds the kinds of all Items in an array; returns how many Items there were. A bad one
+// (e.g. a template that has no key until it's spawned) is skipped, not the whole list.
+static int CollectKeys(uint8_t *arr, int &errors) {
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(it)) continue;
+        try {
+            auto *k = G.itemKey[it]();
+            if (k) SeeKey(k->str());
+        } catch (...) { errors++; }
+    }
+    return (int)n;
+}
+// The game's full item list: look through the game's own classes whose name has "Item" in it
+// (item definitions, item databases and such) and read every text field named like "...key..."
+// on every loaded object of those classes. Done with the il2cpp reflection calls; the list of
+// classes and fields is worked out once, the objects are read every time the page opens.
+struct KeySource { Il2CppObject *type; std::vector<int> offsets; };
+static std::vector<KeySource> g_keySources;
+static Ref g_keySourceTypes[48];
+static bool g_keySourcesFound = false;
+static int g_keyClasses = 0;
+static void FindKeySources() {
+    if (g_keySourcesFound) return;
+    g_keySourcesFound = true;
+    auto R = ym::api()->resolve;
+    auto getImage = (void *(*)(void *))R("il2cpp_class_get_image");
+    auto count = (size_t (*)(const void *))R("il2cpp_image_get_class_count");
+    auto getClass = (void *(*)(const void *, size_t))R("il2cpp_image_get_class");
+    auto className = (const char *(*)(void *))R("il2cpp_class_get_name");
+    auto getFields = (void *(*)(void *, void **))R("il2cpp_class_get_fields");
+    auto fieldName = (const char *(*)(void *))R("il2cpp_field_get_name");
+    auto fieldType = (const void *(*)(void *))R("il2cpp_field_get_type");
+    auto fieldFlags = (int (*)(void *))R("il2cpp_field_get_flags");
+    auto fieldOffset = (size_t (*)(void *))R("il2cpp_field_get_offset");
+    auto typeKind = (int (*)(const void *))R("il2cpp_type_get_type");
+    auto getParent = (void *(*)(void *))R("il2cpp_class_get_parent");
+    auto classType = (const void *(*)(void *))R("il2cpp_class_get_type");
+    auto typeObject = (Il2CppObject *(*)(const void *))R("il2cpp_type_get_object");
+    auto isSub = (bool (*)(void *, void *, bool))R("il2cpp_class_is_subclass_of");
+    Class uobj("UnityEngine", "Object");
+    if (!getImage || !count || !getClass || !className || !getFields || !fieldName || !fieldType || !fieldFlags || !fieldOffset ||
+        !typeKind || !classType || !typeObject || !isSub || !uobj.IsValid() || !G.tItem) {
+        ym::log("clientdabell: item list: reflection calls missing");
+        return;
+    }
+    void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();   // the game's own code (its image) comes from the Item class
+    void *image = itemClass ? getImage(itemClass) : nullptr;
+    size_t n = image ? count(image) : 0;
+    for (size_t i = 0; i < n && g_keySources.size() < 48; i++) {
+        void *k = getClass(image, i);
+        const char *nm = k ? className(k) : nullptr;
+        if (!nm || !strstr(nm, "Item") || !isSub(k, uobj.GetClass(), false)) continue;   // item-ish Unity objects only
+        KeySource src{};
+        for (void *c = k; c && c != uobj.GetClass(); c = getParent ? getParent(c) : nullptr) {   // its fields and its parents'
+            void *iter = nullptr;
+            while (void *f = getFields(c, &iter)) {
+                const char *fn = fieldName(f);
+                if (!fn || (fieldFlags(f) & 0x10)) continue;                  // 0x10 = static
+                if (typeKind(fieldType(f)) != 0x0e) continue;                 // 0x0e = string
+                std::string low = fn;
+                for (auto &ch : low) ch = (char)tolower(ch);
+                if (low.find("key") == std::string::npos) continue;
+                bool junk = false;                                            // translation / sound / icon keys aren't item names
+                for (const char *w : {"name", "loc", "desc", "text", "sound", "audio", "anim", "icon", "input", "button", "sfx"})
+                    junk |= low.find(w) != std::string::npos;
+                if (junk) continue;
+                src.offsets.push_back((int)fieldOffset(f));
+            }
+            if (src.offsets.size() >= 4) break;
+        }
+        if (src.offsets.empty()) continue;
+        Il2CppObject *t = typeObject(classType(k));
+        if (!t) continue;
+        g_keySourceTypes[g_keySources.size()].set(t);
+        src.type = nullptr;                                 // kept in g_keySourceTypes (held from the garbage collector)
+        g_keySources.push_back(src);
+        g_keyClasses++;
+        ym::log("clientdabell: item list source: %s (%d key fields)", nm, (int)src.offsets.size());
+    }
+}
+static int ReadKeySources(int &errors) {
+    int objects = 0;
+    if (!G.findAll.IsValid()) return 0;
+    for (size_t s2 = 0; s2 < g_keySources.size(); s2++) {
+        Il2CppObject *t = g_keySourceTypes[s2].get();
+        if (!t) continue;
+        try {
+            auto *arr = (uint8_t *)G.findAll(t);
+            size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+            for (size_t i = 0; i < n && i < 2000; i++) {
+                Il2CppObject *o = ((Il2CppObject **)(arr + 0x20))[i];
+                if (!o) continue;
+                objects++;
+                for (int off : g_keySources[s2].offsets) {
+                    auto *str = *(BNM::Structures::Mono::String **)((uint8_t *)o + off);
+                    if (str) SeeKey(str->str());
+                }
+            }
+        } catch (...) { errors++; }
+    }
+    return objects;
+}
+static void ScanCatalog() {
+    if (!G.tItem || !G.itemKey.IsValid()) { Notify("Item list isn't available in this game"); return; }
+    int errors = 0, all = 0, room = 0;
+    if (G.findAll.IsValid()) {                            // everything loaded, templates included
+        try { all = CollectKeys((uint8_t *)G.findAll((Il2CppObject *)G.tItem), errors); } catch (...) { errors++; }
+    }
+    if (G.findScene.IsValid() || G.findSceneByType.IsValid()) {   // the items in this room
+        try {
+            room = CollectKeys((uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem)
+                                                                 : G.findSceneByType((Il2CppObject *)G.tItem, 0)), errors);
+        } catch (...) { errors++; }
+    }
+    if (g_itemKey[0]) SeeKey(g_itemKey);                 // the last item you held
+    int defs = 0;
+    try { FindKeySources(); defs = ReadKeySources(errors); } catch (...) { errors++; }
+    std::vector<std::string> keys = g_seenKeys;
+    std::sort(keys.begin(), keys.end());
+    g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
+    g_catalog = std::move(keys);
+    g_spawnView.reserve(g_catalog.size());
+    for (auto &k : g_catalog) g_spawnView.push_back({SPAWNER, k.c_str(), ACTION, MAIN, nullptr, SpawnPicked});
+    g_page = 0;
+    ym::log("clientdabell: item spawner: %d kinds (loaded=%d room=%d defs=%d/%d errors=%d)", (int)g_catalog.size(), all, room,
+            g_keyClasses, defs, errors);
+    // the numbers say where it looked, for fixing it if the list is short
+    Notify("%d items (loaded=%d room=%d defs=%d/%d err=%d)", (int)g_catalog.size(), all, room, g_keyClasses, defs, errors);
+}
+// Tapping an item in the list: one of it appears 80 cm in front of you. Same limits as
+// Spawn On Hand: one every 0.3 s, through the item queue (2 sent per frame, 32 waiting at most).
+static void SpawnPicked() {
+    Item *it = g_lastPressed;
+    Il2CppObject *head = g_head.get();
+    if (!it || !head || g_spawnView.empty() || it < &g_spawnView[0] || it > &g_spawnView.back()) return;
+    if (g_time < g_nextItem) return;
+    if (g_itemQueue.size() >= 32) { Notify("Wait a moment"); return; }
+    g_nextItem = g_time + 0.3;
+    snprintf(g_itemKey, sizeof g_itemKey, "%s", g_catalog[it - &g_spawnView[0]].c_str());
+    Vector3 f = G.trGetForward[head]();
+    g_itemQueue.push_back({G.trGetPosition[head]() + f * 0.8f + Vector3(0, -0.2f, 0), Vector3(0, 0, 0)});
+    Notify("Spawned %.40s", g_itemKey);
+}
+
 static void SpawnOnHandTick(const Buttons &in) {
     bool press = in.rtrig && !g_onHandTrigger;
     g_onHandTrigger = in.rtrig;
