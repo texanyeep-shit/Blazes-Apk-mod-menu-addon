@@ -528,8 +528,8 @@ static void OverpoweredOff();
 static void NextWeatherIntensity();
 static void TodPicked();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, SPAWNER, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers", "Item Spawner"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, SPAWNER, BLOCKS, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers", "Item Spawner", "Game Finder"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -595,6 +595,7 @@ static Item g_items[] = {
 
     {ITEMS, "Exit Items", OPEN, MAIN},
     {ITEMS, "Item Spawner", OPEN, SPAWNER},
+    {ITEMS, "Game Finder", OPEN, BLOCKS},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
@@ -673,6 +674,10 @@ static std::vector<std::string> g_catalog;              // item kinds (their key
 static std::vector<Item> g_spawnView;                    // one button per kind (labels point into g_catalog)
 static void SpawnPicked();
 static Item g_spawnExit = {SPAWNER, "Exit Item Spawner", OPEN, ITEMS};
+// Block Finder: every kind of game object with "Block" in its name, and how many are loaded.
+static std::vector<std::string> g_blockInfo;
+static std::vector<Item> g_blockView;
+static Item g_blockExit = {BLOCKS, "Exit Game Finder", OPEN, ITEMS};
 static Item *g_lastPressed = nullptr;                   // the button being pressed right now (for SpawnPicked)
 static bool f_modsPaused = false;               // Enabled Mods -> Disable All Mods is on: the mods that were on are saved here
 static std::vector<Item *> g_pausedMods;
@@ -720,6 +725,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
     {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
+    {"Game Finder", "Shows how the game stores items and blocks (for the full item list). Send a video of all its pages."},
     {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
@@ -877,7 +883,10 @@ static void DisableAllMods() {
 
 static void BuildView() {
     g_view.clear();
-    if (g_cat == SPAWNER) {
+    if (g_cat == BLOCKS) {
+        g_view.push_back(&g_blockExit);
+        for (auto &it : g_blockView) g_view.push_back(&it);
+    } else if (g_cat == SPAWNER) {
         g_view.push_back(&g_spawnExit);
         for (auto &it : g_spawnView) g_view.push_back(&it);
     } else if (g_cat == ENABLED) {
@@ -1245,6 +1254,8 @@ static void RebuildMenuNow() {
 }
 
 static void ScanCatalog();
+static void ScanBlocks();
+static void SaveSettings();
 static void Press(Item *it) {
     g_lastPressed = it;
     switch (it->kind) {
@@ -1255,6 +1266,7 @@ static void Press(Item *it) {
         g_page = 0;
         if (it->target == SOUNDBOARD) { try { ScanSongs(); } catch (...) { ym::log("clientdabell: song scan error"); } }
         if (it->target == SPAWNER) { try { ScanCatalog(); } catch (...) { ym::log("clientdabell: item list error"); } }
+        if (it->target == BLOCKS) { try { ScanBlocks(); } catch (...) { ym::log("clientdabell: block finder error"); } }
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
@@ -1275,6 +1287,7 @@ static void Press(Item *it) {
     }
     g_dirty = true;
     ym::log("clientdabell: %s", it->label);
+    try { SaveSettings(); } catch (...) {}
 }
 
 // Which part of the menu the pointer touches: row 0..7, -1 = <, kRows = >, -2 = nothing.
@@ -2343,6 +2356,79 @@ static int ReadItemDefinitions() {
     g_defCount = got;
     return got;
 }
+// Game Finder: shows how Yeeps stores items and blocks, so the Item Spawner can list them all.
+// Only reads; nothing is spawned or sent. Lines:
+//   "I: name : type"   what's stored on an Item (and its parent classes)
+//   "N: name : type"   what's stored on the part that spawns items (NetworkMessenger)
+//   "L: Class xN"      game classes named like a list / database / catalog / prefab, and how many are loaded
+//   "B: Class xN"      game classes with "Block" in the name, and how many are loaded
+static void ScanBlocks() {
+    Refl &r = Reflection();
+    auto R = ym::api()->resolve;
+    auto getImage = (void *(*)(void *))R("il2cpp_class_get_image");
+    auto count = (size_t (*)(const void *))R("il2cpp_image_get_class_count");
+    auto getClass = (void *(*)(const void *, size_t))R("il2cpp_image_get_class");
+    auto typeName = (char *(*)(const void *))R("il2cpp_type_get_name");
+    auto freeMem = (void (*)(void *))R("il2cpp_free");
+    Class uobj("UnityEngine", "Object"), mono("UnityEngine", "MonoBehaviour");
+    g_blockView.clear();
+    g_blockInfo.clear();
+    if (!r.ok || !getImage || !count || !getClass || !uobj.IsValid() || !G.findAll.IsValid()) { Notify("Game Finder isn't available"); return; }
+    void *uobjClass = uobj.GetClass(), *monoClass = mono.IsValid() ? (void *)mono.GetClass() : uobjClass;
+    auto Add = [&](const char *prefix, const std::string &text) {
+        if (g_blockInfo.size() >= 160) return;
+        std::string line = std::string(prefix) + text;
+        if (line.size() > 70) line.resize(70);
+        g_blockInfo.push_back(line);
+        ym::log("clientdabell: game finder: %s", line.c_str());
+    };
+    auto Fields = [&](const char *prefix, void *k) {               // every field of a class and its parents, with its type
+        for (int depth = 0; k && k != monoClass && k != uobjClass && depth < 6; depth++, k = r.getParent(k)) {
+            void *iter = nullptr;
+            while (void *f = r.getFields(k, &iter)) {
+                const char *fn = r.fieldName(f);
+                char *tn = typeName ? typeName(r.fieldType(f)) : nullptr;
+                std::string t = tn ? tn : "?";
+                if (tn && freeMem) freeMem(tn);
+                size_t dot = t.rfind('.', t.find('<') == std::string::npos ? std::string::npos : t.find('<'));
+                if (dot != std::string::npos) t = t.substr(dot + 1);          // short type names
+                Add(prefix, std::string((r.fieldFlags(f) & 0x10) ? "static " : "") + (fn ? fn : "?") + " : " + t);
+            }
+        }
+    };
+    void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
+    Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
+    if (net.IsValid()) Fields("N: ", net.GetClass());          // the part that spawns items first (the item's own lines go last)
+    void *image = itemClass ? getImage(itemClass) : nullptr;
+    size_t n = image ? count(image) : 0;
+    std::vector<std::string> lists, blocks;
+    for (size_t i = 0; i < n; i++) {
+        void *k = getClass(image, i);
+        const char *nm = k ? r.className(k) : nullptr;
+        if (!nm || !r.isSub(k, uobjClass, false)) continue;
+        bool isBlock = strstr(nm, "Block") || strstr(nm, "block");
+        bool isList = strstr(nm, "Catalog") || strstr(nm, "Database") || strstr(nm, "Registry") || strstr(nm, "Library") ||
+                      strstr(nm, "Prefab") || strstr(nm, "ItemData") || strstr(nm, "ItemDef") || strstr(nm, "ItemInfo") ||
+                      strstr(nm, "ItemList") || strstr(nm, "Manager") || strstr(nm, "Shop") || strstr(nm, "Store");
+        if (!isBlock && !isList) continue;
+        Il2CppObject *t = r.typeObject(r.classType(k));
+        int loaded = 0;
+        if (t) { try { auto *arr = (uint8_t *)G.findAll(t); loaded = arr ? (int)*(uintptr_t *)(arr + 0x18) : 0; } catch (...) {} }
+        if (loaded == 0 && !isBlock) continue;                         // only list-like ones that are actually loaded
+        std::string line = std::string(nm) + " x" + std::to_string(loaded);
+        (isBlock ? blocks : lists).push_back(line);
+    }
+    std::sort(lists.begin(), lists.end());
+    std::sort(blocks.begin(), blocks.end());
+    for (auto &l : lists) Add("L: ", l);
+    for (auto &b : blocks) Add("B: ", b);
+    if (itemClass) Fields("I: ", itemClass);                   // already seen: last, and cut off by the line limit
+    g_blockView.reserve(g_blockInfo.size());
+    for (auto &b : g_blockInfo) g_blockView.push_back({BLOCKS, b.c_str(), ACTION, MAIN, nullptr, nullptr});
+    g_page = 0;
+    Notify("%d lines, %d pages (send a video of all of them)", (int)g_blockInfo.size(), (int)(g_blockInfo.size() + 8) / 8);
+}
+
 static void ScanCatalog() {
     if (!G.tItem || !G.itemKey.IsValid()) { Notify("Item list isn't available in this game"); return; }
     int errors = 0, all = 0, room = 0;
@@ -4479,6 +4565,56 @@ static void OverpoweredReset() {                               // room change: t
     for (auto &r : g_ring) Kill(r);
 }
 
+// ---- saved settings ------------------------------------------------------------------
+// Your settings are kept in clientdabell_settings.txt next to the mod files (one "name=value"
+// per line), written whenever you press a button and read once when the game starts. Only
+// settings are saved, not mods (so nothing turns itself on when you join a room).
+static std::string SettingsPath() {
+    const char *base = ym::api()->modsDir;
+    return std::string(base ? base : ".") + "/clientdabell_settings.txt";
+}
+struct IntSetting { const char *name; int *v; int count; };
+struct BoolSetting { const char *name; bool *v; };
+static const IntSetting kIntSettings[] = {
+    {"theme", &g_theme, kThemeCount}, {"pointer", &g_pointerSpot, 4}, {"ironSpeed", &g_ironSpeed, 4},
+    {"carSpeed", &g_carSpeed, 3}, {"soundVolume", &g_soundVol, 3}, {"effectIntensity", &g_wxIntensity, 3},
+    {"armLength", &g_armScale, 4}, {"jumpPower", &g_jumpPower, 4},
+};
+static const BoolSetting kBoolSettings[] = {
+    {"rightHandMenu", &f_rightHand}, {"barkMode", &f_barkMode}, {"rainbowMenu", &f_rainbow}, {"colorBlindMode", &f_colorBlind},
+    {"showFps", &f_fps}, {"showClock", &f_clock}, {"notifications", &f_notify}, {"othersHearIt", &f_soundMic},
+};
+static std::string g_lastSaved;
+static void SaveSettings() {
+    std::string text = "# ClientDaBell settings\n";
+    for (auto &st : kIntSettings) text += std::string(st.name) + "=" + std::to_string(*st.v) + "\n";
+    for (auto &st : kBoolSettings) text += std::string(st.name) + "=" + (*st.v ? "1" : "0") + "\n";
+    if (text == g_lastSaved) return;                    // nothing changed: don't write
+    FILE *f = fopen(SettingsPath().c_str(), "w");
+    if (!f) { ym::log("clientdabell: couldn't save settings to %s", SettingsPath().c_str()); return; }
+    fputs(text.c_str(), f);
+    fclose(f);
+    g_lastSaved = text;
+}
+static void LoadSettings() {
+    FILE *f = fopen(SettingsPath().c_str(), "r");
+    if (!f) { ym::log("clientdabell: no saved settings yet"); return; }
+    char line[128];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq) continue;
+        *eq = 0;
+        int v = atoi(eq + 1);
+        for (auto &st : kIntSettings)
+            if (!strcmp(line, st.name) && v >= 0 && v < st.count) { *st.v = v; n++; }
+        for (auto &st : kBoolSettings)
+            if (!strcmp(line, st.name)) { *st.v = v != 0; n++; }
+    }
+    fclose(f);
+    ym::log("clientdabell: loaded %d saved settings", n);
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
@@ -4514,6 +4650,11 @@ static void OnUpdate(float dt) {
     static double fpsStart = 0;
     if (g_time - fpsStart >= 1.0) { g_fps = (float)(g_frames / (g_time - fpsStart)); g_frames = 0; fpsStart = g_time; }
     if (!Lookups()) return;
+    static bool settingsLoaded = false;
+    if (!settingsLoaded) {                              // once: your saved settings, before the menu is built
+        settingsLoaded = true;
+        try { LoadSettings(); SaveSettings(); } catch (...) {}
+    }
     auto *player = (Il2CppObject *)ym::api()->localPlayer();
     if (!player) return;
     if (player != g_player.get()) {                 // first frame in this room
