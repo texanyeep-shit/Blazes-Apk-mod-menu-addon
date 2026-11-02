@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v.1.2.7"
+#define CDB_VERSION "v.1.2.7 Patch #1"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -2104,7 +2104,20 @@ static Il2CppObject *ItemRigidbody(Il2CppObject *it) {
     }
     return Alive(rb) ? rb : nullptr;
 }
+// Collision off while an item orbits (so dragging it through walls, the floor and you doesn't
+// make the game push it around), back on when it's let go.
+static void ItemCollision(Il2CppObject *it, bool on) {
+    Il2CppObject *go = Alive(it) ? G.compGameObject[it]() : nullptr;
+    if (!go || !G.tCollider || !G.colliderSetEnabled.IsValid() || !G.getComponentsInChildren.IsValid()) return;
+    auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tCollider, true);
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n && i < 16; i++) {
+        Il2CppObject *c = ((Il2CppObject **)(arr + 0x20))[i];
+        if (Alive(c)) G.colliderSetEnabled[c](on);
+    }
+}
 static void OrbitReleaseOne(int k) {                    // give item k its physics back and take it out
+    try { ItemCollision(g_orbitItem[k].get(), true); } catch (...) {}
     Il2CppObject *rb = g_orbitRb[k].get();
     if (Alive(rb)) {
         if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](false);
@@ -2129,7 +2142,9 @@ static void OrbitAdd(Il2CppObject *it) {
     if (rb) {
         g_orbitRb[k].set(rb);
         if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);   // we move it, not physics
+        G.rbSetVelocity[rb](Vector3(0, 0, 0));
     }
+    try { ItemCollision(it, false); } catch (...) {}
     g_orbitAdded[k] = g_time;
 }
 static bool OrbitHas(Il2CppObject *it) {
@@ -2164,15 +2179,9 @@ static void ItemOrbitTick(float dt) {
     Il2CppObject *head = g_head.get();
     if (!head) { f_itemOrbit = false; g_dirty = true; OrbitRelease(); return; }
     // They keep spinning until you switch Item Orbit off. An item that's gone (despawned) is
-    // taken out; one the game still counts as held is let go again (once a second).
-    static double nextLetGo = 0;
-    bool letGo = g_time >= nextLetGo;
-    if (letGo) nextLetGo = g_time + 1.0;
-    for (int k = g_orbitN - 1; k >= 0; k--) {
-        Il2CppObject *it = g_orbitItem[k].get();
-        if (!Alive(it)) { OrbitReleaseOne(k); continue; }
-        if (letGo && G.itemHeld.IsValid() && G.itemHeld[it]()) { try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {} }
-    }
+    // taken out. Nothing is sent to the room while they spin (only the one "let go" at the start).
+    for (int k = g_orbitN - 1; k >= 0; k--)
+        if (!Alive(g_orbitItem[k].get())) OrbitReleaseOne(k);
     if (g_orbitN == 0) return;                          // nothing to spin right now (stays on until you switch it off)
     g_orbitAng += 1.6f * dt;                             // about one lap every 4 seconds
     if (g_orbitAng > 6.2831853f) g_orbitAng -= 6.2831853f;
@@ -2185,10 +2194,13 @@ static void ItemOrbitTick(float dt) {
         Il2CppObject *t = G.compTransform[g_orbitItem[k].get()]();
         G.trSetPosition[t](pos);
         G.trSetRotation[t](rot);
-        Il2CppObject *rb = g_orbitRb[k].get();
-        if (Alive(rb)) {
-            if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);   // keep physics off if the game turns it back on
-            G.rbSetVelocity[rb](Vector3(0, 0, 0));
+    }
+    static double nextRecheck = 0;                       // twice a second: keep physics paused if the game turned it back on
+    if (g_time >= nextRecheck) {
+        nextRecheck = g_time + 0.5;
+        for (int k = 0; k < g_orbitN; k++) {
+            Il2CppObject *rb = g_orbitRb[k].get();
+            if (Alive(rb) && G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);
         }
     }
 }
