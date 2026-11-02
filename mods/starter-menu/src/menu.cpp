@@ -528,8 +528,8 @@ static void OverpoweredOff();
 static void NextWeatherIntensity();
 static void TodPicked();
 
-enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, SPAWNER, NCAT };
-static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers", "Item Spawner"};
+enum Cat { MAIN, MOVEMENT, RIG, ITEMS, SOUNDBOARD, EFFECTS, OVERPOWERED, SETTINGS, ENABLED, EMOTES, CREDITS, BETA, SPAWNER, BLOCKS, NCAT };
+static const char *kCatName[NCAT] = {"Main", "Movement Mods", "Rig Mods", "Items", "Soundboard", "Effects", "Overpowered", "Settings", "Enabled Mods", "Emotes", "Credits", "Beta Testers", "Item Spawner", "Block Finder"};
 enum Kind { OPEN, TOGGLE, ACTION };
 struct Item {
     Cat cat;
@@ -595,6 +595,7 @@ static Item g_items[] = {
 
     {ITEMS, "Exit Items", OPEN, MAIN},
     {ITEMS, "Item Spawner", OPEN, SPAWNER},
+    {ITEMS, "Block Finder", OPEN, BLOCKS},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
@@ -673,6 +674,10 @@ static std::vector<std::string> g_catalog;              // item kinds (their key
 static std::vector<Item> g_spawnView;                    // one button per kind (labels point into g_catalog)
 static void SpawnPicked();
 static Item g_spawnExit = {SPAWNER, "Exit Item Spawner", OPEN, ITEMS};
+// Block Finder: every kind of game object with "Block" in its name, and how many are loaded.
+static std::vector<std::string> g_blockInfo;
+static std::vector<Item> g_blockView;
+static Item g_blockExit = {BLOCKS, "Exit Block Finder", OPEN, ITEMS};
 static Item *g_lastPressed = nullptr;                   // the button being pressed right now (for SpawnPicked)
 static bool f_modsPaused = false;               // Enabled Mods -> Disable All Mods is on: the mods that were on are saved here
 static std::vector<Item *> g_pausedMods;
@@ -720,6 +725,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
     {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
+    {"Block Finder", "Lists how the game makes blocks (for adding block spawning). Send a picture of it."},
     {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
@@ -877,7 +883,10 @@ static void DisableAllMods() {
 
 static void BuildView() {
     g_view.clear();
-    if (g_cat == SPAWNER) {
+    if (g_cat == BLOCKS) {
+        g_view.push_back(&g_blockExit);
+        for (auto &it : g_blockView) g_view.push_back(&it);
+    } else if (g_cat == SPAWNER) {
         g_view.push_back(&g_spawnExit);
         for (auto &it : g_spawnView) g_view.push_back(&it);
     } else if (g_cat == ENABLED) {
@@ -1245,6 +1254,7 @@ static void RebuildMenuNow() {
 }
 
 static void ScanCatalog();
+static void ScanBlocks();
 static void Press(Item *it) {
     g_lastPressed = it;
     switch (it->kind) {
@@ -1255,6 +1265,7 @@ static void Press(Item *it) {
         g_page = 0;
         if (it->target == SOUNDBOARD) { try { ScanSongs(); } catch (...) { ym::log("clientdabell: song scan error"); } }
         if (it->target == SPAWNER) { try { ScanCatalog(); } catch (...) { ym::log("clientdabell: item list error"); } }
+        if (it->target == BLOCKS) { try { ScanBlocks(); } catch (...) { ym::log("clientdabell: block finder error"); } }
         break;
     case TOGGLE:
         *it->flag = !*it->flag;
@@ -2343,6 +2354,41 @@ static int ReadItemDefinitions() {
     g_defCount = got;
     return got;
 }
+// Block Finder: goes through the game's own classes (Assembly-CSharp) for ones with "Block" in
+// the name that are Unity objects, and counts how many of each are loaded. Only reads; nothing
+// is spawned or sent. It's there to show how Yeeps makes blocks, so block spawning can be added.
+static void ScanBlocks() {
+    Refl &r = Reflection();
+    auto R = ym::api()->resolve;
+    auto getImage = (void *(*)(void *))R("il2cpp_class_get_image");
+    auto count = (size_t (*)(const void *))R("il2cpp_image_get_class_count");
+    auto getClass = (void *(*)(const void *, size_t))R("il2cpp_image_get_class");
+    Class uobj("UnityEngine", "Object");
+    g_blockView.clear();
+    g_blockInfo.clear();
+    if (!r.ok || !getImage || !count || !getClass || !uobj.IsValid() || !G.findAll.IsValid()) { Notify("Block Finder isn't available"); return; }
+    void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
+    void *image = itemClass ? getImage(itemClass) : nullptr;
+    size_t n = image ? count(image) : 0;
+    for (size_t i = 0; i < n && g_blockInfo.size() < 64; i++) {
+        void *k = getClass(image, i);
+        const char *nm = k ? r.className(k) : nullptr;
+        if (!nm || !(strstr(nm, "Block") || strstr(nm, "block")) || !r.isSub(k, uobj.GetClass(), false)) continue;
+        Il2CppObject *t = r.typeObject(r.classType(k));
+        int loaded = 0;
+        if (t) { try { auto *arr = (uint8_t *)G.findAll(t); loaded = arr ? (int)*(uintptr_t *)(arr + 0x18) : 0; } catch (...) {} }
+        char line[80];
+        snprintf(line, sizeof line, "%.50s x%d", nm, loaded);
+        g_blockInfo.push_back(line);
+        ym::log("clientdabell: block finder: %s", line);
+    }
+    std::sort(g_blockInfo.begin(), g_blockInfo.end());
+    g_blockView.reserve(g_blockInfo.size());
+    for (auto &b : g_blockInfo) g_blockView.push_back({BLOCKS, b.c_str(), ACTION, MAIN, nullptr, nullptr});
+    g_page = 0;
+    Notify(g_blockInfo.empty() ? "No block types found" : "%d block types (send a picture)", (int)g_blockInfo.size());
+}
+
 static void ScanCatalog() {
     if (!G.tItem || !G.itemKey.IsValid()) { Notify("Item list isn't available in this game"); return; }
     int errors = 0, all = 0, room = 0;
