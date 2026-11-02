@@ -91,6 +91,9 @@ static struct {
     Method<Il2CppObject *> audioClipCreate;           // soundboard
     Method<bool> audioClipSetData, audioClipGetData;
     Method<int> audioClipSamples, asGetTimeSamples;
+    Method<float> asGetVolume;
+    Method<void> asGetOutputData;                      // Disable Songs: how loud another player is
+    BNM::MonoType *tSpeaker = nullptr;                 // Photon Voice's Speaker: plays another player's voice
     Method<void> asSetClip, asSetVolume, asSetSpatial, asSetLoop, asPlay, asStop;
     Method<bool> asIsPlaying;
     BNM::MonoType *tAudioSource = nullptr;
@@ -173,8 +176,12 @@ static bool Lookups() {
             G.asPlay = asrc.GetMethod("Play", 0);
             G.asStop = asrc.GetMethod("Stop", 0);
             G.asGetTimeSamples = asrc.GetMethod("get_timeSamples", 0);     // where the song is now
+            G.asGetVolume = asrc.GetMethod("get_volume", 0);
+            G.asGetOutputData = Overload(asrc, "GetOutputData", {"System.Single[]", "System.Int32"});
             G.asIsPlaying = asrc.GetMethod("get_isPlaying", 0);
         }
+        Class spk("Photon.Voice.Unity", "Speaker");
+        if (spk.IsValid()) G.tSpeaker = spk.GetMonoType();
         Class rec("Photon.Voice.Unity", "Recorder");
         if (rec.IsValid()) {
             G.tRecorder = rec.GetMonoType();
@@ -441,9 +448,10 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash;
+static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash, f_itemOrbit;
 static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_overlap = false;                  // Play while a song plays mixes the two together
+static bool f_disableSongs = false;             // mute other players while they play music
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
@@ -481,6 +489,7 @@ static void ArmDupe9();
 static void ArmDupe27();
 static void ArmDupe9x3();
 static void ItemRain();
+static void ItemOrbitToggled();
 static bool LeftHandItem();
 static void ScanSongs();
 static void PlaySong();
@@ -489,6 +498,7 @@ static void PrevSong();
 static void StopSound();
 static void ApplyLoop();
 static void NextSoundVolume();
+static void DisableSongsToggled();
 static void SoundMicToggled();
 static void WeatherPicked();
 static void LongArmsToggled();
@@ -570,6 +580,7 @@ static Item g_items[] = {
     {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
     {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
     {ITEMS, "Item Rain", ACTION, MAIN, nullptr, ItemRain},
+    {ITEMS, "Item Orbit", TOGGLE, MAIN, &f_itemOrbit, ItemOrbitToggled},
 
     {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
     {SOUNDBOARD, g_soundLabel, ACTION, MAIN, nullptr, PlaySong},
@@ -579,6 +590,7 @@ static Item g_items[] = {
     {SOUNDBOARD, "Others Hear It", TOGGLE, MAIN, &f_soundMic, SoundMicToggled},
     {SOUNDBOARD, "Loop", TOGGLE, MAIN, &f_soundLoop, ApplyLoop},
     {SOUNDBOARD, "Overlap Songs", TOGGLE, MAIN, &f_overlap},
+    {SOUNDBOARD, "Disable Songs", TOGGLE, MAIN, &f_disableSongs, DisableSongsToggled},
     {SOUNDBOARD, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
     {SOUNDBOARD, "Rescan Songs", ACTION, MAIN, nullptr, ScanSongs},
 
@@ -667,6 +679,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
     {"Spawn On Hand", "Each right trigger spawns the item from your left hand at your right hand."},
+    {"Item Orbit", "Hold an item in your left hand, then turn this on: the item circles around you."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
     {"Helicopter", "Both arms spin around you. Hold left trigger."},
@@ -683,6 +696,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Stop Sound", "Stops the song (and cancels a loading one)."},
     {"Loop", "Repeats the song until you stop it."},
     {"Overlap Songs", "On: Play while a song plays adds the new song on top. Both go through voice chat."},
+    {"Disable Songs", "Mutes a player for you while they play music, unmutes them when it stops. A guess, by how steady the sound is."},
     {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
     {"Rescan Songs", "Looks in the sounds folder again."},
     {"Effects", "Weather, discos and time of day. Only you see them."},
@@ -1838,7 +1852,9 @@ static void SpawnGridDims(int w, int d, int h) {
 static void SpawnGrid(int count) { SpawnGridDims(3, 3, count > 9 ? 3 : 1); }   // 3x3 or 3x3x3
 // The item you're holding in your LEFT hand right now (owner 2026-10-31: items spawn as
 // whatever is in your left hand when you press). One scene search per press.
+static Il2CppObject *g_handItemObj = nullptr;   // the item LeftHandItem just found (use right away only)
 static bool LeftHandItem() {
+    g_handItemObj = nullptr;
     Il2CppObject *hand = g_leftHand.get();
     if (!hand || !G.tItem || !G.itemKey.IsValid() || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return false;
     auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem)
@@ -1857,6 +1873,7 @@ static bool LeftHandItem() {
     auto *key = best ? G.itemKey[best]() : nullptr;
     if (!key) { Notify("Hold an item in your left hand"); return false; }
     snprintf(g_itemKey, sizeof g_itemKey, "%s", key->str().c_str());
+    g_handItemObj = best;
     return true;
 }
 static void ArmDupe9() { if (LeftHandItem()) SpawnGrid(9); }
@@ -1877,6 +1894,69 @@ static void ItemRain() {
     double before = g_nextBatch;
     QueueItems(list);
     if (g_nextBatch != before) Notify("Item Rain!");
+}
+
+// Item Orbit: the item in your left hand is let go (the game's own drop) and then moved in a
+// circle around you every frame, about 1 m out at chest height, bobbing and spinning. Its
+// physics is paused while it orbits; turning Item Orbit off (or grabbing the item) gives it
+// back its physics, so it drops.
+static Ref g_orbitItem, g_orbitRb;
+static float g_orbitAng = 0;
+static double g_orbitStart = 0;
+static Il2CppObject *ItemRigidbody(Il2CppObject *it) {
+    Il2CppObject *go = Alive(it) ? G.compGameObject[it]() : nullptr;
+    Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go](G.tRigidbody) : nullptr;
+    if (!rb && go && G.getComponentsInChildren.IsValid()) {
+        auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tRigidbody, true);
+        if (arr && *(uintptr_t *)(arr + 0x18) > 0) rb = ((Il2CppObject **)(arr + 0x20))[0];
+    }
+    return Alive(rb) ? rb : nullptr;
+}
+static void OrbitRelease() {
+    Il2CppObject *rb = g_orbitRb.get();
+    if (Alive(rb)) {
+        if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](false);
+        if (G.rbSetUseGravity.IsValid()) G.rbSetUseGravity[rb](true);
+    }
+    g_orbitItem.clear();
+    g_orbitRb.clear();
+}
+static void ItemOrbitToggled() {
+    if (!f_itemOrbit) { OrbitRelease(); Notify("Item Orbit off"); return; }
+    if (!LeftHandItem() || !Alive(g_handItemObj)) { f_itemOrbit = false; g_dirty = true; return; }   // LeftHandItem said why
+    Il2CppObject *it = g_handItemObj;
+    try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}   // let go of it
+    g_orbitItem.set(it);
+    Il2CppObject *rb = ItemRigidbody(it);
+    if (rb) {
+        g_orbitRb.set(rb);
+        if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);   // we move it, not physics
+    }
+    g_orbitAng = 0;
+    g_orbitStart = g_time;
+    Notify("Item Orbit on");
+}
+static void ItemOrbitTick(float dt) {
+    if (!f_itemOrbit) { if (g_orbitItem.get()) OrbitRelease(); return; }   // switched off some other way
+    Il2CppObject *it = g_orbitItem.get(), *head = g_head.get();
+    if (!Alive(it) || !head) { f_itemOrbit = false; g_dirty = true; OrbitRelease(); return; }
+    // grabbed again (after it had a moment to leave your hand): stop orbiting
+    if (g_time - g_orbitStart > 1.0 && G.itemHeld.IsValid() && G.itemHeld[it]()) {
+        f_itemOrbit = false; g_dirty = true; OrbitRelease(); Notify("Item Orbit off (grabbed)"); return;
+    }
+    g_orbitAng += 2.2f * dt;                             // about one lap every 3 seconds
+    if (g_orbitAng > 6.2831853f) g_orbitAng -= 6.2831853f;
+    Vector3 hp = G.trGetPosition[head]();
+    Vector3 pos(hp.x + cosf(g_orbitAng) * 1.0f, hp.y - 0.35f + 0.12f * sinf(g_orbitAng * 2.0f), hp.z + sinf(g_orbitAng) * 1.0f);
+    Il2CppObject *t = G.compTransform[it]();
+    G.trSetPosition[t](pos);
+    float spin = (float)g_time * 3.0f;
+    G.trSetRotation[t](Quaternion(0, sinf(spin * 0.5f), 0, cosf(spin * 0.5f)));
+    Il2CppObject *rb = g_orbitRb.get();
+    if (Alive(rb)) {
+        if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);   // keep physics off if the game turns it back on
+        G.rbSetVelocity[rb](Vector3(0, 0, 0));
+    }
 }
 
 // Spawn On Hand: each right-trigger press (grip open) spawns the item at your hand.
@@ -2595,6 +2675,101 @@ static void ApplyLoop() {
         if (!f_soundLoop) g_micUntil = g_time + g_clipLen + 0.5;     // at most one more play-through
     }
 }
+// ---- Disable Songs ------------------------------------------------------------------
+// Other players' songs come through their voice chat, so a song can't be told apart from
+// talking for sure. This guesses from how the sound behaves: talking has short pauses all the
+// time, music keeps going. Each other player's voice (Photon Voice's Speaker, and the
+// AudioSource it plays through) is measured 10 times a second. If it stays loud with no pause
+// for kSongSecs, they're muted for you (volume turned almost all the way down, so it can
+// still be measured). When it's quiet for kQuietSecs (the music stopped), their volume goes
+// back. Only your own game changes; nothing is sent.
+static constexpr int kMaxSpeakers = 16;
+static constexpr float kSongSecs = 5.0f, kQuietSecs = 1.0f, kPauseSecs = 0.3f, kLoud = 0.015f, kMutedVol = 0.02f;
+static struct SpeakerWatch { Ref src; float loudRun = 0, quietRun = 0, volBefore = 1; bool muted = false; } g_spk[kMaxSpeakers];
+static int g_spkN = 0;
+static Ref g_spkBuf;
+static double g_nextSpkFind = 0, g_nextSpkMeasure = 0;
+
+static void SpeakerUnmute(SpeakerWatch &w) {
+    Il2CppObject *src = w.src.get();
+    if (w.muted && Alive(src) && G.asSetVolume.IsValid()) G.asSetVolume[src](w.volBefore);
+    w.muted = false;
+}
+static void DisableSongsReset() {                       // everyone back to normal
+    for (int i = 0; i < g_spkN; i++) { try { SpeakerUnmute(g_spk[i]); } catch (...) {} g_spk[i].src.clear(); g_spk[i] = SpeakerWatch(); }
+    g_spkN = 0;
+    g_nextSpkFind = g_nextSpkMeasure = 0;
+}
+static void DisableSongsToggled() {
+    if (!f_disableSongs) { DisableSongsReset(); Notify("Disable Songs off"); }
+    else Notify(G.tSpeaker && G.asGetOutputData.IsValid() ? "Disable Songs on" : "Disable Songs isn't available in this game");
+}
+// Look for other players' voices now and then (they come and go as players join and leave).
+static void FindSpeakers() {
+    if (!G.findScene.IsValid() && !G.findSceneByType.IsValid()) return;
+    auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tSpeaker)
+                                                  : G.findSceneByType((Il2CppObject *)G.tSpeaker, 0));
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppObject *sp = ((Il2CppObject **)(arr + 0x20))[i];
+        Il2CppObject *go = Alive(sp) ? G.compGameObject[sp]() : nullptr;
+        Il2CppObject *src = go ? G.goGetComponent[go](G.tAudioSource) : nullptr;
+        if (!Alive(src) || src == g_audioSrc.get()) continue;
+        bool known = false;
+        for (int k = 0; k < g_spkN && !known; k++) known = g_spk[k].src.get() == src;
+        if (known || g_spkN >= kMaxSpeakers) continue;
+        g_spk[g_spkN] = SpeakerWatch();
+        g_spk[g_spkN].src.set(src);
+        g_spkN++;
+    }
+    for (int k = 0; k < g_spkN; ) {                    // forget players who left
+        if (Alive(g_spk[k].src.get())) { k++; continue; }
+        g_spk[k].src.clear();                           // free this one's handle, then move the last one here
+        g_spk[k] = g_spk[g_spkN - 1];
+        g_spk[g_spkN - 1] = SpeakerWatch();
+        g_spkN--;
+    }
+}
+static void DisableSongsTick() {
+    if (!f_disableSongs && g_spkN > 0) DisableSongsReset();   // switched off some other way (Turn Everything Off): unmute everyone
+    if (!f_disableSongs || !G.tSpeaker || !G.asGetOutputData.IsValid() || !G.asSetVolume.IsValid() || !G.arrayNew || !G.floatClass) return;
+    if (g_time >= g_nextSpkFind) { g_nextSpkFind = g_time + 2.0; FindSpeakers(); }
+    if (g_time < g_nextSpkMeasure) return;
+    const float step = 0.1f;
+    g_nextSpkMeasure = g_time + step;
+    if (!g_spkBuf.get()) g_spkBuf.set((Il2CppObject *)G.arrayNew(G.floatClass, 1024));
+    Il2CppObject *buf = g_spkBuf.get();
+    if (!buf) return;
+    float *d = (float *)((uint8_t *)buf + 0x20);
+    for (int k = 0; k < g_spkN; k++) {
+        SpeakerWatch &w = g_spk[k];
+        Il2CppObject *src = w.src.get();
+        if (!Alive(src)) continue;
+        G.asGetOutputData[src](buf, 0);
+        double sum = 0;
+        for (int i = 0; i < 1024; i++) sum += d[i] * d[i];
+        float rms = sqrtf((float)(sum / 1024));
+        // While muted the volume is turned down, so scale back up to how loud they really are
+        float level = w.muted ? rms / kMutedVol : rms;
+        if (level > kLoud) { w.loudRun += step; w.quietRun = 0; }
+        else {
+            w.quietRun += step;
+            if (w.quietRun >= kPauseSecs) w.loudRun = 0;   // a pause: that's talking, not a song
+        }
+        if (!w.muted && w.loudRun >= kSongSecs) {
+            w.volBefore = G.asGetVolume.IsValid() ? G.asGetVolume[src]() : 1.0f;
+            if (w.volBefore < kMutedVol * 2) w.volBefore = 1.0f;
+            G.asSetVolume[src](kMutedVol);
+            w.muted = true;
+            Notify("Muted a song");
+            ym::log("clientdabell: disable songs: muted speaker %d (level %.3f)", k, level);
+        } else if (w.muted) {
+            G.asSetVolume[src](kMutedVol);              // keep it down if the game turns it back up
+            if (w.quietRun >= kQuietSecs) { SpeakerUnmute(w); w.loudRun = 0; Notify("Song stopped, unmuted"); }
+        }
+    }
+}
+
 static void NextSoundVolume() {
     g_soundVol = (g_soundVol + 1) % 3;
     Il2CppObject *src = g_audioSrc.get();
@@ -3818,6 +3993,8 @@ static void OverpoweredReset() {                               // room change: t
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
+    g_orbitItem.clear(); g_orbitRb.clear(); f_itemOrbit = false;
+    try { DisableSongsReset(); } catch (...) {}
     // The old room's objects are gone (or about to be): forget them, build again.
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
@@ -3884,8 +4061,12 @@ static void OnUpdate(float dt) {
     ApplyGravity();
     NoclipTick(in);
     TeleportGunTick(in);
+    try { ItemOrbitTick(dt); }
+    catch (...) { f_itemOrbit = false; try { OrbitRelease(); } catch (...) {} ym::log("clientdabell: item orbit error, turned off"); }
     try { SpawnOnHandTick(in); ItemQueueTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
+    try { DisableSongsTick(); }
+    catch (...) { f_disableSongs = false; try { DisableSongsReset(); } catch (...) {} ym::log("clientdabell: disable songs error, turned off"); }
     try { LoadTick(); SoundTick(); }
     catch (...) { AbortLoad(); ym::log("clientdabell: song loading error"); }
     try { WeatherTick(dt); }
