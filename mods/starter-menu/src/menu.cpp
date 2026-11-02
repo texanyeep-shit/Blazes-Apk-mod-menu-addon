@@ -2370,59 +2370,69 @@ static void ScanBlocks() {
     auto getClass = (void *(*)(const void *, size_t))R("il2cpp_image_get_class");
     auto typeName = (char *(*)(const void *))R("il2cpp_type_get_name");
     auto freeMem = (void (*)(void *))R("il2cpp_free");
-    Class uobj("UnityEngine", "Object"), mono("UnityEngine", "MonoBehaviour");
+    Class uobj("UnityEngine", "Object");
     g_blockView.clear();
     g_blockInfo.clear();
-    if (!r.ok || !getImage || !count || !getClass || !uobj.IsValid() || !G.findAll.IsValid()) { Notify("Game Finder isn't available"); return; }
-    void *uobjClass = uobj.GetClass(), *monoClass = mono.IsValid() ? (void *)mono.GetClass() : uobjClass;
-    auto Add = [&](const char *prefix, const std::string &text) {
-        if (g_blockInfo.size() >= 160) return;
-        std::string line = std::string(prefix) + text;
-        if (line.size() > 70) line.resize(70);
-        g_blockInfo.push_back(line);
-        ym::log("clientdabell: game finder: %s", line.c_str());
+    if (!r.ok || !getImage || !count || !getClass || !typeName || !uobj.IsValid() || !G.findAll.IsValid()) { Notify("Game Finder isn't available"); return; }
+    void *uobjClass = uobj.GetClass();
+    auto Add = [&](const std::string &line) {
+        if (g_blockInfo.size() >= 200) return;
+        g_blockInfo.push_back(line.size() > 90 ? line.substr(0, 90) : line);
+        ym::log("clientdabell: game finder: %s", g_blockInfo.back().c_str());
     };
-    auto Fields = [&](const char *prefix, void *k) {               // every field of a class and its parents, with its type
-        for (int depth = 0; k && k != monoClass && k != uobjClass && depth < 6; depth++, k = r.getParent(k)) {
-            void *iter = nullptr;
-            while (void *f = r.getFields(k, &iter)) {
-                const char *fn = r.fieldName(f);
-                char *tn = typeName ? typeName(r.fieldType(f)) : nullptr;
-                std::string t = tn ? tn : "?";
-                if (tn && freeMem) freeMem(tn);
-                size_t dot = t.rfind('.', t.find('<') == std::string::npos ? std::string::npos : t.find('<'));
-                if (dot != std::string::npos) t = t.substr(dot + 1);          // short type names
-                Add(prefix, std::string((r.fieldFlags(f) & 0x10) ? "static " : "") + (fn ? fn : "?") + " : " + t);
-            }
+    // A readable short type: drop "System.Collections.Generic." and "System." prefixes
+    auto Short = [](std::string t) {
+        for (const char *p : {"System.Collections.Generic.", "UnityEngine.", "System."})
+            for (size_t at; (at = t.find(p)) != std::string::npos;) t.erase(at, strlen(p));
+        return t;
+    };
+    // A field name: readable names as they are, scrambled ones cut to "#" plus 3 characters
+    // (scrambled names become "#" + the field's position in its class, which stays the same)
+    auto Name = [](const char *fn, int idx) {
+        std::string n = fn ? fn : "?";
+        bool plain = true;
+        for (unsigned char c : n) if (c > 126 || c < 32) { plain = false; break; }
+        return plain ? (n.size() > 28 ? n.substr(0, 28) : n) : std::string("#") + std::to_string(idx);
+    };
+    // Lists, tables and arrays of a class (only those: they're what an item list would be)
+    auto Collections = [&](const char *prefix, void *k) {
+        void *iter = nullptr;
+        int idx = -1;
+        while (void *f = r.getFields(k, &iter)) {
+            idx++;
+            int kind = r.typeKind(r.fieldType(f));
+            if (kind != 0x15 && kind != 0x1d) continue;            // generic (List/Dictionary/HashSet) or array
+            char *tn = typeName(r.fieldType(f));
+            std::string t = tn ? Short(tn) : "?";
+            if (tn && freeMem) freeMem(tn);
+            Add(std::string(prefix) + ((r.fieldFlags(f) & 0x10) ? "static " : "") + Name(r.fieldName(f), idx) + " : " + t);
         }
     };
-    void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
     Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
-    if (net.IsValid()) Fields("N: ", net.GetClass());          // the part that spawns items first (the item's own lines go last)
+    if (net.IsValid()) Collections("N: ", net.GetClass());
+    void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
     void *image = itemClass ? getImage(itemClass) : nullptr;
     size_t n = image ? count(image) : 0;
-    std::vector<std::string> lists, blocks;
+    std::vector<std::pair<std::string, void *>> found;
     for (size_t i = 0; i < n; i++) {
         void *k = getClass(image, i);
         const char *nm = k ? r.className(k) : nullptr;
         if (!nm || !r.isSub(k, uobjClass, false)) continue;
-        bool isBlock = strstr(nm, "Block") || strstr(nm, "block");
-        bool isList = strstr(nm, "Catalog") || strstr(nm, "Database") || strstr(nm, "Registry") || strstr(nm, "Library") ||
-                      strstr(nm, "Prefab") || strstr(nm, "ItemData") || strstr(nm, "ItemDef") || strstr(nm, "ItemInfo") ||
-                      strstr(nm, "ItemList") || strstr(nm, "Manager") || strstr(nm, "Shop") || strstr(nm, "Store");
-        if (!isBlock && !isList) continue;
+        bool want = false;
+        for (const char *w : {"Item", "Build", "Store", "Block", "Inventory", "Prefab", "Spawn", "Catalog", "Database", "Shop"})
+            want |= strstr(nm, w) != nullptr;
+        if (!want) continue;
         Il2CppObject *t = r.typeObject(r.classType(k));
         int loaded = 0;
         if (t) { try { auto *arr = (uint8_t *)G.findAll(t); loaded = arr ? (int)*(uintptr_t *)(arr + 0x18) : 0; } catch (...) {} }
-        if (loaded == 0 && !isBlock) continue;                         // only list-like ones that are actually loaded
-        std::string line = std::string(nm) + " x" + std::to_string(loaded);
-        (isBlock ? blocks : lists).push_back(line);
+        if (loaded == 0) continue;                                   // only parts that are actually loaded
+        found.push_back({std::string(nm) + " x" + std::to_string(loaded), k});
     }
-    std::sort(lists.begin(), lists.end());
-    std::sort(blocks.begin(), blocks.end());
-    for (auto &l : lists) Add("L: ", l);
-    for (auto &b : blocks) Add("B: ", b);
-    if (itemClass) Fields("I: ", itemClass);                   // already seen: last, and cut off by the line limit
+    std::sort(found.begin(), found.end());
+    for (auto &fk : found) {
+        Add("C: " + fk.first);
+        Collections("   ", fk.second);
+    }
     g_blockView.reserve(g_blockInfo.size());
     for (auto &b : g_blockInfo) g_blockView.push_back({BLOCKS, b.c_str(), ACTION, MAIN, nullptr, nullptr});
     g_page = 0;
