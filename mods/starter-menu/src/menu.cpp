@@ -92,6 +92,8 @@ static struct {
     Method<bool> audioClipSetData, audioClipGetData;
     Method<int> audioClipSamples, asGetTimeSamples;
     Method<float> asGetVolume;
+    Method<void> asSetMute;
+    Method<bool> asGetMute;
     Method<void> asGetOutputData;                      // Disable Songs: how loud another player is (if the game has it)
     Method<Il2CppObject *> asGetClip;                  // ...else read the clip Photon writes their voice into
     BNM::MonoType *tSpeaker = nullptr;                 // Photon Voice's Speaker: plays another player's voice
@@ -179,6 +181,8 @@ static bool Lookups() {
             G.asGetTimeSamples = asrc.GetMethod("get_timeSamples", 0);     // where the song is now
             G.asGetVolume = asrc.GetMethod("get_volume", 0);
             G.asGetClip = asrc.GetMethod("get_clip", 0);
+            G.asSetMute = asrc.GetMethod("set_mute", 1);
+            G.asGetMute = asrc.GetMethod("get_mute", 0);
             for (auto &m : asrc.GetMethods(false)) {          // GetOutputData(float[], int): the array one, not (int, int)
                 auto *mi = m.GetInfo();
                 if (!mi || !mi->name || strcmp(mi->name, "GetOutputData") != 0 || mi->parameters_count != 2) continue;
@@ -2693,7 +2697,19 @@ static void ApplyLoop() {
 // back. Only your own game changes; nothing is sent.
 static constexpr int kMaxSpeakers = 16;
 static constexpr float kSongSecs = 5.0f, kQuietSecs = 1.0f, kPauseSecs = 0.3f, kLoud = 0.015f, kMutedVol = 0.02f;
-static struct SpeakerWatch { Ref src; float loudRun = 0, quietRun = 0, volBefore = 1; bool muted = false; } g_spk[kMaxSpeakers];
+static struct SpeakerWatch { Ref src, go; float loudRun = 0, quietRun = 0, volBefore = 1; bool muted = false, byMute = false, muteBefore = false; } g_spk[kMaxSpeakers];
+// Mute or unmute every sound player on that player's voice object (the game can play a voice
+// through more than one, and keeps setting their volume, so the mute switch is used).
+static void SetVoiceMute(Il2CppObject *go, Il2CppObject *src, bool on) {
+    if (Alive(src)) G.asSetMute[src](on);
+    if (!go || !G.getComponentsInChildren.IsValid()) return;
+    auto *ca = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tAudioSource, true);
+    size_t n = ca ? *(uintptr_t *)(ca + 0x18) : 0;
+    for (size_t i = 0; i < n && i < 8; i++) {
+        Il2CppObject *a = ((Il2CppObject **)(ca + 0x20))[i];
+        if (Alive(a) && a != g_audioSrc.get()) G.asSetMute[a](on);
+    }
+}
 static int g_spkN = 0, g_spkFound = -1;           // voices being watched; Speakers in the scene
 static float g_spkMaxLevel = 0;                        // loudest voice since the last on-screen report
 static double g_nextSpkReport = 0;
@@ -2702,18 +2718,17 @@ static double g_nextSpkFind = 0, g_nextSpkMeasure = 0;
 
 static void SpeakerUnmute(SpeakerWatch &w) {
     Il2CppObject *src = w.src.get();
-    if (w.muted && Alive(src) && G.asSetVolume.IsValid()) G.asSetVolume[src](w.volBefore);
+    if (w.muted && w.byMute) SetVoiceMute(w.go.get(), src, w.muteBefore);   // back to how it was (you may have muted them yourself)
+    else if (w.muted && Alive(src) && G.asSetVolume.IsValid()) G.asSetVolume[src](w.volBefore);
     w.muted = false;
 }
 static void DisableSongsReset() {                       // everyone back to normal
-    for (int i = 0; i < g_spkN; i++) { try { SpeakerUnmute(g_spk[i]); } catch (...) {} g_spk[i].src.clear(); g_spk[i] = SpeakerWatch(); }
+    for (int i = 0; i < g_spkN; i++) { try { SpeakerUnmute(g_spk[i]); } catch (...) {} g_spk[i].src.clear(); g_spk[i].go.clear(); g_spk[i] = SpeakerWatch(); }
     g_spkN = 0;
     g_nextSpkFind = g_nextSpkMeasure = 0;
 }
 static void DisableSongsToggled() {
-    g_nextSpkReport = g_time + 2.5;                     // first report right after the [ON] message
-    if (!f_disableSongs) { DisableSongsReset(); Notify("Disable Songs off"); }
-    else Notify(G.tSpeaker && G.asGetOutputData.IsValid() ? "Disable Songs on" : "Disable Songs isn't available in this game");
+    if (!f_disableSongs) DisableSongsReset();
 }
 // Look for other players' voices now and then (they come and go as players join and leave).
 static void FindSpeakers() {
@@ -2741,11 +2756,12 @@ static void FindSpeakers() {
         if (known || g_spkN >= kMaxSpeakers) continue;
         g_spk[g_spkN] = SpeakerWatch();
         g_spk[g_spkN].src.set(src);
+        g_spk[g_spkN].go.set(go);
         g_spkN++;
     }
     for (int k = 0; k < g_spkN; ) {                    // forget players who left
         if (Alive(g_spk[k].src.get())) { k++; continue; }
-        g_spk[k].src.clear();                           // free this one's handle, then move the last one here
+        g_spk[k].src.clear(); g_spk[k].go.clear();      // free this one's handles, then move the last one here
         g_spk[k] = g_spk[g_spkN - 1];
         g_spk[g_spkN - 1] = SpeakerWatch();
         g_spkN--;
@@ -2756,22 +2772,14 @@ static void DisableSongsTick() {
     if (!f_disableSongs) return;
     bool canClip = G.asGetClip.IsValid() && G.audioClipGetData.IsValid() && G.asGetTimeSamples.IsValid() && G.audioClipSamples.IsValid();
     if (!G.tSpeaker || !(G.asGetOutputData.IsValid() || canClip) || !G.asSetVolume.IsValid() || !G.arrayNew || !G.floatClass) {
-        if (g_time >= g_nextSpkReport) {                 // say what's missing (for fixing it)
-            g_nextSpkReport = g_time + 3.0;
-            Notify("Songs: missing speaker=%d data=%d clip=%d vol=%d buf=%d", G.tSpeaker ? 1 : 0, G.asGetOutputData.IsValid() ? 1 : 0, canClip ? 1 : 0,
-                   G.asSetVolume.IsValid() ? 1 : 0, G.arrayNew && G.floatClass ? 1 : 0);
+        if (g_time >= g_nextSpkReport) {                 // log what's missing (once a minute)
+            g_nextSpkReport = g_time + 60.0;
+            ym::log("clientdabell: disable songs missing speaker=%d data=%d clip=%d vol=%d buf=%d", G.tSpeaker ? 1 : 0,
+                    G.asGetOutputData.IsValid() ? 1 : 0, canClip ? 1 : 0, G.asSetVolume.IsValid() ? 1 : 0, G.arrayNew && G.floatClass ? 1 : 0);
         }
         return;
     }
     if (g_time >= g_nextSpkFind) { g_nextSpkFind = g_time + 2.0; FindSpeakers(); }
-    if (g_time >= g_nextSpkReport) {                     // on-screen check (for fixing it): what it sees
-        g_nextSpkReport = g_time + 3.0;
-        float run = 0;
-        int muted = 0;
-        for (int k = 0; k < g_spkN; k++) { run = std::max(run, g_spk[k].loudRun); muted += g_spk[k].muted; }
-        Notify("Songs: speakers=%d voices=%d loud=%.3f run=%.1fs muted=%d", g_spkFound, g_spkN, g_spkMaxLevel, run, muted);
-        g_spkMaxLevel = 0;
-    }
     if (g_time < g_nextSpkMeasure) return;
     const float step = 0.1f;
     g_nextSpkMeasure = g_time + step;
@@ -2789,7 +2797,7 @@ static void DisableSongsTick() {
         if (G.asIsPlaying.IsValid() && !G.asIsPlaying[src]()) {   // their voice isn't playing at all: silent
             w.quietRun += step;
             if (w.quietRun >= kPauseSecs) w.loudRun = 0;
-            if (w.muted && w.quietRun >= kQuietSecs) { SpeakerUnmute(w); w.loudRun = 0; Notify("Song stopped, unmuted"); }
+            if (w.muted && w.quietRun >= kQuietSecs) { SpeakerUnmute(w); w.loudRun = 0; }
             continue;
         }
         Il2CppObject *clip = canClip ? G.asGetClip[src]() : nullptr;
@@ -2809,7 +2817,7 @@ static void DisableSongsTick() {
         for (int i = 0; i < 1024; i++) sum += d[i] * d[i];
         float rms = sqrtf((float)(sum / 1024));
         // AudioSource output is after the volume: while muted, scale back up to how loud they really are
-        float level = (w.muted && !fromClip) ? rms / kMutedVol : rms;
+        float level = (w.muted && !w.byMute && !fromClip) ? rms / kMutedVol : rms;
         if (level > g_spkMaxLevel) g_spkMaxLevel = level;
         if (level > kLoud) { w.loudRun += step; w.quietRun = 0; }
         else {
@@ -2817,15 +2825,24 @@ static void DisableSongsTick() {
             if (w.quietRun >= kPauseSecs) w.loudRun = 0;   // a pause: that's talking, not a song
         }
         if (!w.muted && w.loudRun >= kSongSecs) {
-            w.volBefore = G.asGetVolume.IsValid() ? G.asGetVolume[src]() : 1.0f;
-            if (w.volBefore < kMutedVol * 2) w.volBefore = 1.0f;
-            G.asSetVolume[src](kMutedVol);
+            // The mute switch when we can still measure from the clip (it isn't affected by
+            // muting); else turn the volume down so it can still be measured.
+            w.byMute = fromClip && G.asSetMute.IsValid();
+            if (w.byMute) {
+                w.muteBefore = G.asGetMute.IsValid() && G.asGetMute[src]();
+                SetVoiceMute(w.go.get(), src, true);
+            } else {
+                w.volBefore = G.asGetVolume.IsValid() ? G.asGetVolume[src]() : 1.0f;
+                if (w.volBefore < kMutedVol * 2) w.volBefore = 1.0f;
+                G.asSetVolume[src](kMutedVol);
+            }
             w.muted = true;
             Notify("Muted a song");
             ym::log("clientdabell: disable songs: muted speaker %d (level %.3f)", k, level);
         } else if (w.muted) {
-            G.asSetVolume[src](kMutedVol);              // keep it down if the game turns it back up
-            if (w.quietRun >= kQuietSecs) { SpeakerUnmute(w); w.loudRun = 0; Notify("Song stopped, unmuted"); }
+            if (w.byMute) SetVoiceMute(w.go.get(), src, true);   // keep it muted if the game turns it back on
+            else G.asSetVolume[src](kMutedVol);                   // keep it down if the game turns it back up
+            if (w.quietRun >= kQuietSecs) { SpeakerUnmute(w); w.loudRun = 0; }
         }
     }
 }
