@@ -2037,6 +2037,7 @@ static void SpawnGrid(int count) { SpawnGridDims(3, 3, count > 9 ? 3 : 1); }   /
 // The item you're holding in your LEFT hand right now (owner 2026-10-31: items spawn as
 // whatever is in your left hand when you press). One scene search per press.
 static Il2CppObject *g_handItemObj = nullptr;   // the item LeftHandItem just found (use right away only)
+static void SeeKey(const std::string &key);
 static bool LeftHandItem() {
     g_handItemObj = nullptr;
     Il2CppObject *hand = g_leftHand.get();
@@ -2057,6 +2058,7 @@ static bool LeftHandItem() {
     auto *key = best ? G.itemKey[best]() : nullptr;
     if (!key) { Notify("Hold an item in your left hand"); return false; }
     snprintf(g_itemKey, sizeof g_itemKey, "%s", key->str().c_str());
+    SeeKey(g_itemKey);
     g_handItemObj = best;
     return true;
 }
@@ -2223,28 +2225,150 @@ static void ItemOrbitTick(float dt) {
 static bool g_onHandTrigger = false;
 // Item Spawner: every Item the game has loaded (Resources.FindObjectsOfTypeAll also finds the
 // item prefabs that aren't in the room), one entry per item kind. Built when the page opens.
-static void ScanCatalog() {
-    if (!G.tItem || !G.itemKey.IsValid() || !G.findAll.IsValid()) { Notify("Item list isn't available in this game"); return; }
-    std::vector<std::string> keys;
-    auto *arr = (uint8_t *)G.findAll((Il2CppObject *)G.tItem);
+static std::vector<std::string> g_seenKeys;               // every item kind seen this session (grows as you play)
+static void SeeKey(const std::string &key) {
+    if (key.empty() || key.size() >= 60 || g_seenKeys.size() >= 400) return;
+    for (auto &k : g_seenKeys) if (k == key) return;
+    g_seenKeys.push_back(key);
+}
+// Adds the kinds of all Items in an array; returns how many Items there were. A bad one
+// (e.g. a template that has no key until it's spawned) is skipped, not the whole list.
+static int CollectKeys(uint8_t *arr, int &errors) {
     size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
     for (size_t i = 0; i < n; i++) {
         Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
         if (!Alive(it)) continue;
-        auto *k = G.itemKey[it]();
-        std::string key = k ? k->str() : "";
-        if (!key.empty() && key.size() < 60) keys.push_back(key);
+        try {
+            auto *k = G.itemKey[it]();
+            if (k) SeeKey(k->str());
+        } catch (...) { errors++; }
     }
+    return (int)n;
+}
+// The game's full item list. A real item in the room is used to find where the game keeps item
+// names: each object the item points to (its item definition, usually) is checked for a text
+// field that holds exactly this item's name. When one matches, that kind of object and that
+// field are the game's item list: every loaded object of that kind gives one item name. Worked
+// out once (when there's an item around to check); read every time the page opens.
+static Ref g_defType;                                      // System.Type of the item definitions
+static int g_defOffset = -1, g_defCount = 0;
+static bool g_defFound = false;
+static std::string g_defName;
+struct Refl {
+    bool ok = false;
+    const char *(*className)(void *); void *(*getFields)(void *, void **); const char *(*fieldName)(void *);
+    const void *(*fieldType)(void *); int (*fieldFlags)(void *); size_t (*fieldOffset)(void *); int (*typeKind)(const void *);
+    void *(*getParent)(void *); const void *(*classType)(void *); Il2CppObject *(*typeObject)(const void *);
+    bool (*isSub)(void *, void *, bool);
+};
+static Refl &Reflection() {
+    static Refl r;
+    static bool tried = false;
+    if (tried) return r;
+    tried = true;
+    auto R = ym::api()->resolve;
+    r.className = (decltype(r.className))R("il2cpp_class_get_name");
+    r.getFields = (decltype(r.getFields))R("il2cpp_class_get_fields");
+    r.fieldName = (decltype(r.fieldName))R("il2cpp_field_get_name");
+    r.fieldType = (decltype(r.fieldType))R("il2cpp_field_get_type");
+    r.fieldFlags = (decltype(r.fieldFlags))R("il2cpp_field_get_flags");
+    r.fieldOffset = (decltype(r.fieldOffset))R("il2cpp_field_get_offset");
+    r.typeKind = (decltype(r.typeKind))R("il2cpp_type_get_type");
+    r.getParent = (decltype(r.getParent))R("il2cpp_class_get_parent");
+    r.classType = (decltype(r.classType))R("il2cpp_class_get_type");
+    r.typeObject = (decltype(r.typeObject))R("il2cpp_type_get_object");
+    r.isSub = (decltype(r.isSub))R("il2cpp_class_is_subclass_of");
+    r.ok = r.className && r.getFields && r.fieldName && r.fieldType && r.fieldFlags && r.fieldOffset && r.typeKind &&
+           r.getParent && r.classType && r.typeObject && r.isSub;
+    return r;
+}
+// Calls fn(offset) for every non-static field of kind `kind` on class k and its parents (up to stop).
+template <typename F> static void EachField(Refl &r, void *k, void *stop, int kind, F fn) {
+    for (int depth = 0; k && k != stop && depth < 8; depth++, k = r.getParent(k)) {
+        void *iter = nullptr;
+        while (void *f = r.getFields(k, &iter)) {
+            if (r.fieldFlags(f) & 0x10) continue;                          // static
+            if (r.typeKind(r.fieldType(f)) != kind) continue;
+            fn((int)r.fieldOffset(f));
+        }
+    }
+}
+static void FindItemDefinitions() {
+    if (g_defFound || !G.tItem || !G.itemKey.IsValid() || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return;
+    Refl &r = Reflection();
+    Class uobj("UnityEngine", "Object"), mono("UnityEngine", "MonoBehaviour");
+    if (!r.ok || !uobj.IsValid()) return;
+    void *uobjClass = uobj.GetClass(), *monoClass = mono.IsValid() ? (void *)mono.GetClass() : uobjClass;
+    auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem) : G.findSceneByType((Il2CppObject *)G.tItem, 0));
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    for (size_t i = 0; i < n && i < 30 && !g_defFound; i++) {             // a few real items to check against
+        Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(it)) continue;
+        std::string key;
+        try { auto *k = G.itemKey[it](); key = k ? k->str() : ""; } catch (...) {}
+        if (key.empty()) continue;
+        // the objects this item points to (0x12 = a class reference)
+        EachField(r, it->klass, monoClass, 0x12, [&](int off) {
+            if (g_defFound) return;
+            Il2CppObject *def = *(Il2CppObject **)((uint8_t *)it + off);
+            if (!def || !def->klass || !r.isSub(def->klass, uobjClass, false)) return;   // only loaded Unity objects (assets)
+            // a text field on it (0x0e = string) holding exactly this item's name
+            EachField(r, def->klass, uobjClass, 0x0e, [&](int soff) {
+                if (g_defFound) return;
+                auto *str = *(BNM::Structures::Mono::String **)((uint8_t *)def + soff);
+                if (!str || str->str() != key) return;
+                Il2CppObject *t = r.typeObject(r.classType(def->klass));
+                if (!t) return;
+                g_defType.set(t);
+                g_defOffset = soff;
+                g_defName = r.className(def->klass) ? r.className(def->klass) : "?";
+                g_defFound = true;
+            });
+        });
+    }
+    if (g_defFound) ym::log("clientdabell: item list: the game's item names are in %s (field at %d)", g_defName.c_str(), g_defOffset);
+}
+static int ReadItemDefinitions() {
+    Il2CppObject *t = g_defType.get();
+    if (!g_defFound || !t || !G.findAll.IsValid()) return 0;
+    auto *arr = (uint8_t *)G.findAll(t);
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    int got = 0;
+    for (size_t i = 0; i < n && i < 2000; i++) {
+        Il2CppObject *d = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!d) continue;
+        auto *str = *(BNM::Structures::Mono::String **)((uint8_t *)d + g_defOffset);
+        if (str) { SeeKey(str->str()); got++; }
+    }
+    g_defCount = got;
+    return got;
+}
+static void ScanCatalog() {
+    if (!G.tItem || !G.itemKey.IsValid()) { Notify("Item list isn't available in this game"); return; }
+    int errors = 0, all = 0, room = 0;
+    if (G.findAll.IsValid()) {                            // everything loaded, templates included
+        try { all = CollectKeys((uint8_t *)G.findAll((Il2CppObject *)G.tItem), errors); } catch (...) { errors++; }
+    }
+    if (G.findScene.IsValid() || G.findSceneByType.IsValid()) {   // the items in this room
+        try {
+            room = CollectKeys((uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem)
+                                                                 : G.findSceneByType((Il2CppObject *)G.tItem, 0)), errors);
+        } catch (...) { errors++; }
+    }
+    if (g_itemKey[0]) SeeKey(g_itemKey);                 // the last item you held
+    int defs = 0;
+    try { FindItemDefinitions(); defs = ReadItemDefinitions(); } catch (...) { errors++; }
+    std::vector<std::string> keys = g_seenKeys;
     std::sort(keys.begin(), keys.end());
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-    if (keys.size() > 400) keys.resize(400);
     g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
     g_catalog = std::move(keys);
     g_spawnView.reserve(g_catalog.size());
     for (auto &k : g_catalog) g_spawnView.push_back({SPAWNER, k.c_str(), ACTION, MAIN, nullptr, SpawnPicked});
     g_page = 0;
-    ym::log("clientdabell: item spawner found %d item kinds", (int)g_catalog.size());
-    Notify(g_catalog.empty() ? "No items found" : "%d items", (int)g_catalog.size());
+    ym::log("clientdabell: item spawner: %d kinds (loaded=%d room=%d defs=%d in %s, errors=%d)", (int)g_catalog.size(), all, room,
+            defs, g_defFound ? g_defName.c_str() : "-", errors);
+    if (!g_defFound) Notify("%d items (reopen when there are items in the room for the full list)", (int)g_catalog.size());
+    else Notify("%d items", (int)g_catalog.size());
 }
 // Tapping an item in the list: one of it appears 80 cm in front of you. Same limits as
 // Spawn On Hand: one every 0.3 s, through the item queue (2 sent per frame, 32 waiting at most).
