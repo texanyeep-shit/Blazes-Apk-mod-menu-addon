@@ -460,7 +460,7 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash, f_itemOrbit;
+static bool f_itemGun, f_stealGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash, f_itemOrbit;
 static bool f_autoPlay = false;                  // Soundboard: when a song ends, play the next one
 static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_overlap = false;                  // Play while a song plays mixes the two together
@@ -513,6 +513,7 @@ static void PillowHouse();
 static void ItemOrbitToggled();
 static bool LeftHandItem();
 static bool HeldItemKey(Il2CppObject *hand);
+static bool StealItemAt(Vector3 point, int side);
 static void ScanSongs();
 static void PlaySong();
 static void NextSong();
@@ -609,13 +610,13 @@ static Item g_items[] = {
     {ITEMS, "Item Spawner", OPEN, SPAWNER},
     {ITEMS, "Game Finder", OPEN, BLOCKS},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
+    {ITEMS, "Steal Item Gun (consenting)", TOGGLE, MAIN, &f_stealGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
     {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
     {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
     {ITEMS, "Item Rain", ACTION, MAIN, nullptr, ItemRain},
     {ITEMS, "Item Circle", ACTION, MAIN, nullptr, ItemCircle},
-    {ITEMS, "Pillow House", ACTION, MAIN, nullptr, PillowHouse},
     {ITEMS, "Item Orbit", TOGGLE, MAIN, &f_itemOrbit, ItemOrbitToggled},
 
     {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
@@ -743,7 +744,6 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
     {"Game Finder", "Shows how the game stores items and blocks (for the full item list). Send a video of all its pages."},
     {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
-    {"Pillow House", "Builds a big house out of pillows in front of you (71 pillows, a few seconds). Everyone sees it."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
@@ -1724,7 +1724,7 @@ static void NoclipTick(const Buttons &in) {
 static Ref g_gunLine, g_gunLineGo, g_gunBall;
 static bool g_gunTrigger = false;
 static void TeleportGunTick(const Buttons &in) {
-    bool aiming = (f_tpGun || f_itemGun) && in.rgrip;
+    bool aiming = (f_tpGun || f_itemGun || f_stealGun) && in.rgrip;
     if (!aiming) {
         Show(g_gunLineGo, false);
         Show(g_gunBall, false);
@@ -1762,7 +1762,12 @@ static void TeleportGunTick(const Buttons &in) {
     G.lrSetPosition[g_gunLine.get()](1, end);
     SetColor(g_gunBall.get(), in.rtrig ? T().buttonOn : T().bgB);
     if (in.rtrig && !g_gunTrigger && found) {
-        if (f_itemGun) {                                  // Spawn Item Gun: an item at that spot
+        if (f_stealGun) {                                 // consenting lobby: grab the item at the ray hit
+            if (g_time >= g_nextItem) {
+                g_nextItem = g_time + 0.5;
+                if (!StealItemAt(end, 0)) Notify("No item grabbed");
+            }
+        } else if (f_itemGun) {                            // Spawn Item Gun: an item at that spot
             if (g_time >= g_nextItem && LeftHandItem()) {
                 g_nextItem = g_time + 0.5;
                 g_itemQueue.push_back({end + Vector3(0, 0.3f, 0), Vector3(0, 0, 0)});
@@ -2088,6 +2093,53 @@ static void FreezeItem(Il2CppObject *it, Vector3 pos, Quaternion rot) {
     }
     if (Il2CppObject *t = G.compTransform[it]()) { G.trSetPosition[t](pos); G.trSetRotation[t](rot); }
 }
+// Placing a building block the way the game does when you let go of one next to a surface: the
+// block's own "deploy" step (found by name on the block, once), or else the game's normal drop.
+static const void *g_deployMethod = nullptr;
+static bool g_deployLooked = false;
+static std::string g_deployName = "drop";
+static const void *FindDeploy(Il2CppObject *it) {
+    if (g_deployLooked) return g_deployMethod;
+    g_deployLooked = true;
+    auto Rs = ym::api()->resolve;
+    auto getMethods = (const void *(*)(void *, void **))Rs("il2cpp_class_get_methods");
+    auto methodName = (const char *(*)(const void *))Rs("il2cpp_method_get_name");
+    auto paramCount = (uint32_t (*)(const void *))Rs("il2cpp_method_get_param_count");
+    auto getParent = (void *(*)(void *))Rs("il2cpp_class_get_parent");
+    if (!getMethods || !methodName || !paramCount || !getParent || !it) return nullptr;
+    static const char *kBest[] = {"TrySendDeploy", "SendDeploy", "TryDeploy", "Deploy", "TrySendPlace", "TryPlace", "Place"};
+    const void *found = nullptr;
+    int foundRank = 100;
+    std::string foundName;
+    for (void *c = it->klass; c; c = getParent(c)) {
+        void *iter = nullptr;
+        while (const void *m = getMethods(c, &iter)) {
+            const char *n = methodName(m);
+            if (!n || paramCount(m) != 0) continue;
+            int rank = 100;
+            for (int k = 0; k < 7; k++) if (!strcmp(n, kBest[k])) rank = k;
+            if (rank == 100 && strstr(n, "Deploy") && !strstr(n, "Preview") && strncmp(n, "Can", 3) && strncmp(n, "Is", 2) &&
+                strncmp(n, "get_", 4) && strncmp(n, "On", 2) && strncmp(n, "Get", 3))
+                rank = 50;
+            if (rank < foundRank) { foundRank = rank; found = m; foundName = n; }
+        }
+    }
+    g_deployMethod = found;
+    if (found) g_deployName = foundName;
+    ym::log("clientdabell: block place step: %s", found ? foundName.c_str() : "none (using drop)");
+    return found;
+}
+static void PlaceBlock(Il2CppObject *it) {
+    auto invoke = (void *(*)(const void *, void *, void **, void **))ym::api()->resolve("il2cpp_runtime_invoke");
+    const void *m = FindDeploy(it);
+    if (m && invoke) {
+        void *exc = nullptr;
+        invoke(m, it, nullptr, &exc);
+        if (!exc) return;
+        ym::log("clientdabell: %s said no, dropping instead", g_deployName.c_str());
+    }
+    try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}
+}
 static void DropItem(Il2CppObject *it) {
     try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}
     Il2CppObject *go = G.compGameObject[it]();
@@ -2136,7 +2188,10 @@ static void DropWatchTick() {
             }
             if (!match) continue;
             if (g_dropWatch[k].orbit) OrbitAdd(it);
-            else if (g_dropWatch[k].freeze) FreezeItem(it, g_dropWatch[k].pos, g_dropWatch[k].rot);
+            else if (g_dropWatch[k].freeze) {
+                FreezeItem(it, g_dropWatch[k].pos, g_dropWatch[k].rot);
+                if (!strcmp(g_itemKey, "mapObject")) { try { PlaceBlock(it); } catch (...) {} }   // a building block: place it
+            }
             else DropItem(it);
             g_dropWatch.erase(g_dropWatch.begin() + k);
             break;
@@ -3074,7 +3129,7 @@ static void PillowHouseTick() {
         int now = CountInRoom(g_houseKey);
         if (now >= 0 && g_houseBefore >= 0) {
             int got = now - g_houseBefore;
-            Notify("Pillow house: %d of %d showed up", got < 0 ? 0 : got, g_houseTotal);
+            Notify("Pillow house: %d of %d showed up (placed with %.20s)", got < 0 ? 0 : got, g_houseTotal, g_deployName.c_str());
             ym::log("clientdabell: pillow house %s: %d of %d showed up (before %d, after %d)", g_houseKey, got, g_houseTotal, g_houseBefore, now);
         }
     }
@@ -3097,6 +3152,7 @@ static void PillowHouse() {
     std::string key;
     // Whatever you're holding is used as it is (the game's name for the 1x1 pillow may not even
     // say "pillow"), unless it's a bomb or something else that blows up into a bunch of things.
+    g_handItemObj = nullptr;
     if (HeldItemKey(g_leftHand.get()) || HeldItemKey(g_rightHand.get())) {   // either hand works
         std::string low = g_itemKey;
         for (auto &c : low) c = (char)tolower((unsigned char)c);
@@ -3114,11 +3170,35 @@ static void PillowHouse() {
     snprintf(g_houseKey, sizeof g_houseKey, "%s", key.c_str());
     ym::log("clientdabell: pillow house uses %s", g_houseKey);
     // 5 x 5 pillows across, walls 3 high with a doorway (1 wide, 2 high) facing you, a 5 x 5 roof.
-    const float gap = 0.82f;                             // pillow spacing (Yeeps pillows are about 80 cm)
+    // Pillow spacing: the size of the pillow you're holding (its smallest side as it looks now),
+    // or 82 cm if it can't be measured.
+    float gap = 0.82f;
+    if (Alive(g_handItemObj) && G.getComponentsInChildren.IsValid() && G.tRenderer) {
+        struct Bnds { Vector3 c, e; };
+        static Method<Bnds> getBounds = Class("UnityEngine", "Renderer").GetMethod("get_bounds", 0);
+        Il2CppObject *go = G.compGameObject[g_handItemObj]();
+        auto *ra = go ? (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tRenderer, false) : nullptr;
+        size_t rn = ra ? *(uintptr_t *)(ra + 0x18) : 0;
+        float best = 0;
+        for (size_t i = 0; i < rn && i < 8 && getBounds.IsValid(); i++) {
+            Il2CppObject *rr = ((Il2CppObject **)(ra + 0x20))[i];
+            if (!Alive(rr)) continue;
+            Bnds b = getBounds[rr]();
+            float side = 2 * fminf(b.e.x, fminf(b.e.y, b.e.z));
+            if (side > best) best = side;
+        }
+        if (best > 0.15f && best < 2.0f) gap = best;
+        ym::log("clientdabell: pillow house: pillow measures %.2f m, spacing %.2f", best, gap);
+    }
     const int half = 2, wallH = 3;
     Vector3 f = Flat(G.trGetForward[head]()), r = Cross(Vector3(0, 1, 0), f);
     Vector3 hp = G.trGetPosition[head]();
-    Vector3 center = hp + f * 5.0f + Vector3(0, -1.0f, 0);   // near the floor, 5 m out (the front wall is about 3.4 m away)
+    Vector3 center = hp + f * (gap * 2 + 1.8f);          // the front wall about 1.8 m away
+    {                                                    // stand it on the floor: find the ground under the middle
+        BNM::Structures::Unity::RaycastHit hit{};
+        bool ground = G.raycast.IsValid() && G.raycast(center + Vector3(0, 1.0f, 0), Vector3(0, -1, 0), &hit, 6.0f, -5);
+        center.y = (ground ? hit.point.y : hp.y - 1.4f) + gap * 0.5f;
+    }
     Quaternion faceYou = Quaternion::LookRotation(f), side = Quaternion::LookRotation(r);
     std::vector<PendingItem> list;
     auto Add = [&](int x, int y, int z, Quaternion q) {
@@ -5092,6 +5172,80 @@ static Il2CppObject *NearestItem(Vector3 at, float range) {
     }
     return best;
 }
+// Put an item straight into one of your hands the game's own way (MasterPlayer.SetHeldItem), so
+// the long hands can pick things up from far away. The call is only made if it takes what's
+// expected (an item and which hand), checked by its parameter types and names; else no.
+static bool GameGrab(Il2CppObject *item, int side) {
+    static const void *m = nullptr;
+    static int handKind = 0, handArg = 1, itemArg = 0;   // handKind: 1 bool, 2 number; which parameter is which
+    static bool looked = false, leftMeansTrue = true;
+    static std::string sig;
+    auto Rs = ym::api()->resolve;
+    auto invoke = (void *(*)(const void *, void *, void **, void **))Rs("il2cpp_runtime_invoke");
+    Il2CppObject *player = g_player.get();
+    if (!invoke || !player || !Alive(item)) return false;
+    if (!looked) {
+        looked = true;
+        auto getMethods = (const void *(*)(void *, void **))Rs("il2cpp_class_get_methods");
+        auto methodName = (const char *(*)(const void *))Rs("il2cpp_method_get_name");
+        auto paramCount = (uint32_t (*)(const void *))Rs("il2cpp_method_get_param_count");
+        auto paramType = (const void *(*)(const void *, uint32_t))Rs("il2cpp_method_get_param");
+        auto paramName = (const char *(*)(const void *, uint32_t))Rs("il2cpp_method_get_param_name");
+        auto getParent = (void *(*)(void *))Rs("il2cpp_class_get_parent");
+        auto typeKind = (int (*)(const void *))Rs("il2cpp_type_get_type");
+        auto typeName = (char *(*)(const void *))Rs("il2cpp_type_get_name");
+        auto freeMem = (void (*)(void *))Rs("il2cpp_free");
+        if (!getMethods || !methodName || !paramCount || !paramType || !getParent || !typeKind || !typeName) return false;
+        for (void *c = player->klass; c && !m; c = getParent(c)) {
+            void *iter = nullptr;
+            while (const void *mm = getMethods(c, &iter)) {
+                const char *n = methodName(mm);
+                if (!n || strcmp(n, "SetHeldItem") || paramCount(mm) != 2) continue;
+                int kinds[2];
+                std::string names[2], types[2];
+                for (uint32_t i = 0; i < 2; i++) {
+                    kinds[i] = typeKind(paramType(mm, i));
+                    char *tn = typeName(paramType(mm, i));
+                    types[i] = tn ? tn : "?";
+                    if (tn && freeMem) freeMem(tn);
+                    const char *pn = paramName ? paramName(mm, i) : nullptr;
+                    names[i] = pn ? pn : "";
+                    for (auto &ch : names[i]) ch = (char)tolower((unsigned char)ch);
+                }
+                sig = "SetHeldItem(" + types[0] + " " + names[0] + ", " + types[1] + " " + names[1] + ")";
+                ym::log("clientdabell: long arms grab: %s", sig.c_str());
+                for (int a = 0; a < 2; a++) {                       // one is the item (a class), the other the hand
+                    int h = 1 - a;
+                    if (kinds[a] != 0x12) continue;
+                    if (kinds[h] == 0x02) handKind = 1;
+                    else if (kinds[h] == 0x08 || kinds[h] == 0x11) handKind = 2;
+                    else continue;
+                    itemArg = a; handArg = h;
+                    leftMeansTrue = names[h].find("right") == std::string::npos;   // "isLeft"/"left": true = left
+                    m = mm;
+                    break;
+                }
+                break;
+            }
+        }
+        if (!m) ym::log("clientdabell: long arms grab: no usable SetHeldItem (%s)", sig.c_str());
+    }
+    if (!m) return false;
+    bool b = leftMeansTrue ? side == 0 : side == 1;
+    int32_t n = side;                                     // 0 left, 1 right
+    void *args[2];
+    args[itemArg] = item;
+    args[handArg] = handKind == 1 ? (void *)&b : (void *)&n;
+    void *exc = nullptr;
+    invoke(m, player, args, &exc);
+    if (exc) { ym::log("clientdabell: long arms grab: the game said no"); return false; }
+    return true;
+}
+static bool StealItemAt(Vector3 point, int side) {
+    Il2CppObject *item = NearestItem(point, 0.75f);
+    if (!item) return false;
+    try { return GameGrab(item, side); } catch (...) { return false; }
+}
 static void LongArmsGrabTick(const Buttons &in) {
     for (int i = 0; i < 2; i++) {
         bool grip = i ? in.rgrip : in.lgrip, press = grip && !g_laGripPrev[i];
@@ -5100,7 +5254,13 @@ static void LongArmsGrabTick(const Buttons &in) {
         if (press) {
             Vector3 gap = g_laReach[i] - g_laReal[i];
             Il2CppObject *item = Dot(gap, gap) > 0.15f * 0.15f ? NearestItem(g_laReach[i], 0.35f) : nullptr;
-            if (item) { g_laPull[i].set(item); g_laPullUntil[i] = g_time + 0.5; }
+            if (item) {
+                bool grabbed = false;
+                try { grabbed = GameGrab(item, i); } catch (...) {}
+                if (!grabbed) { g_laPull[i].set(item); g_laPullUntil[i] = g_time + 0.5; }   // else: bring it to your hand
+                static int told = 0;                     // say once which way it grabbed (for fixing)
+                if (told++ == 0) Notify(grabbed ? "Long Arms grab: game grab" : "Long Arms grab: pulling it to your hand");
+            }
         }
         Il2CppObject *item = g_laPull[i].get();
         if (!Alive(item) || g_time > g_laPullUntil[i]) { g_laPull[i].clear(); continue; }
