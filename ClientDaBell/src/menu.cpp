@@ -523,6 +523,15 @@ static void SoundMicToggled();
 static void WeatherPicked();
 static void LongArmsToggled();
 static void NextArmLength();
+// Menu Size (Settings): how big the whole menu is. Saved with your settings.
+// Menu Size slider (Settings): slide your finger along the button, 50% at the left end to 150%
+// at the right. The number updates as you slide; the menu changes size when you lift your finger
+// (changing it under your finger would move the slider while you're on it). Saved with settings.
+static int g_menuPct = 100;
+static inline float MenuScale() { return (g_menuPct < 50 ? 50 : g_menuPct > 150 ? 150 : g_menuPct) / 100.0f; }
+static bool g_sliding = false;
+static int g_slidePct = 100;
+static void NextMenuSize();
 static void NextJumpPower();
 static void OverpoweredOff();
 static void NextWeatherIntensity();
@@ -649,6 +658,7 @@ static Item g_items[] = {
     {SETTINGS, "Car Speed", ACTION, MAIN, nullptr, NextCarSpeed},
     {SETTINGS, "Right Hand Menu", TOGGLE, MAIN, &f_rightHand, PointerToHand},
     {SETTINGS, "Bark Mode", TOGGLE, MAIN, &f_barkMode, BarkModeToggled},
+    {SETTINGS, "Menu Size", ACTION, MAIN, nullptr, NextMenuSize},
     {SETTINGS, "Change Menu Theme", ACTION, MAIN, nullptr, NextTheme},
     {SETTINGS, "Rainbow Menu", TOGGLE, MAIN, &f_rainbow},
     {SETTINGS, "Color Blind Mode", TOGGLE, MAIN, &f_colorBlind},
@@ -714,6 +724,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Go To Spot", "Teleports you to your saved spot."},
     {"Change Menu Theme", "Plush Blue, Orange, Blue, Green, Purple, Dark."},
     {"Rainbow Menu", "The menu cycles through colors."},
+    {"Menu Size", "Slide the circle: left is 50%, right is 150%. Let go to resize."},
     {"Color Blind Mode", "Buttons that are on say [ON] and turn orange with dark text; pressed buttons flash white."},
     {"Show FPS", "Frames per second in the title."},
     {"Show Clock", "The time in the title."},
@@ -849,6 +860,7 @@ static std::vector<Item *> g_view;                                // what the cu
 static double g_time = 0, g_nextPress = 0, g_notifyUntil = 0, g_nextTitle = 0;
 static int g_touching = -2, g_frames = 0;
 static Ref g_homeCube, g_homeLabel;
+static Ref g_sliderLine, g_sliderKnob;               // the Menu Size slider: a line and a circle
 static float g_fps = 0;
 
 static int PageCount() { return g_view.empty() ? 1 : (int)(g_view.size() + kRows - 1) / kRows; }
@@ -1061,6 +1073,15 @@ static void BuildMenu() {
     if (!g_barkLayout) g_titleBar.set(Part(bt, T().buttonOn, Vector3(0, kTitleY, -0.002f), Vector3(kBtnW, 0.045f, 0.009f)));
     g_next.set(Part(bt, T().button, Vector3(kSideX, 0, 0), Vector3(kSideW, kSideH, 0.009f)));
     g_homeCube.set(Part(bt, T().button, Vector3(0, kHomeY, -0.005f), Vector3(kHomeW, kHomeH, 0.009f)));
+    g_sliderLine.set(Part(bt, Color(1, 1, 1, 1), Vector3(0, 0, -0.0105f), Vector3(kBtnW * 0.8f, kBtnH * 0.14f, 0.002f)));
+    if (Il2CppObject *knob = Prim(0, Color(1.0f, 0.89f, 0.54f, 1), false)) {
+        Il2CppObject *kt = Tr(knob);
+        G.trSetParent[kt](bt, false);
+        G.trSetLocalScale[kt](Vector3(kBtnH * 0.8f, kBtnH * 0.8f, 0.006f));
+        g_sliderKnob.set(knob);
+    }
+    Show(g_sliderLine, false);
+    Show(g_sliderKnob, false);
 
     if (Il2CppObject *canvas = Canvas(bt, Vector3(0, 0, -0.0105f), std::max(kBoardW, 2 * kSideX + kSideW), kBoardH + 0.2f)) {
         Il2CppObject *ct = Tr(canvas);
@@ -1106,8 +1127,28 @@ static void Notify(const char *fmt, ...) {
 }
 
 // Relabels and recolors the rows. Only runs after something changed.
+// The Menu Size button is drawn as a slider (a line with a circle), so it has no words on it.
+static const char *RowLabel(Item *it) { return it->fn == NextMenuSize ? "" : it->label; }
+static int SliderShownPct() { return g_sliding ? g_slidePct : g_menuPct; }
+static void PlaceKnob(int r) {
+    Il2CppObject *knob = g_sliderKnob.get();
+    if (!Alive(knob)) return;
+    float w = kBtnW * 0.8f, t = (SliderShownPct() - 50) / 100.0f;
+    G.trSetLocalPosition[Tr(knob)](Vector3(RowX(r) - w / 2 + t * w, RowY(r), -0.012f));
+}
 static void RenderPage() {
     BuildView();
+    int sliderRow = -1;
+    for (int r = 0; r < kRows; r++) {
+        int si = g_page * kRows + r;
+        if (si < (int)g_view.size() && g_view[si]->fn == NextMenuSize) sliderRow = r;
+    }
+    Show(g_sliderLine, sliderRow >= 0);
+    Show(g_sliderKnob, sliderRow >= 0);
+    if (sliderRow >= 0) {
+        if (Alive(g_sliderLine.get())) G.trSetLocalPosition[Tr(g_sliderLine.get())](Vector3(RowX(sliderRow), RowY(sliderRow), -0.0105f));
+        PlaceKnob(sliderRow);
+    }
     for (int r = 0; r < kRows; r++) {
         int i = g_page * kRows + r;
         bool used = i < (int)g_view.size();
@@ -1121,15 +1162,15 @@ static void RenderPage() {
             // say [ON] and are orange with near-black text (orange against the blue themes is
             // the pair the common kinds of color blindness all still tell apart, and the
             // brightness differs a lot too); a press flashes white.
-            char lab[96];
-            snprintf(lab, sizeof lab, on ? "[ON] %s" : "%s", it->label);
+            char lab[600];
+            snprintf(lab, sizeof lab, on ? "[ON] %s" : "%s", RowLabel(it));
             SetText(g_rowText[r], lab);
             SetColor(g_rowCube[r].get(), r == g_flashRow ? Color(1, 1, 1, 1) : on ? Color(0.90f, 0.62f, 0.0f, 1) : T().button);
             if (Alive(g_rowText[r].get()))
                 G.graphicSetColor[g_rowText[r].get()](r == g_flashRow || on ? Color(0.08f, 0.08f, 0.08f, 1) : Color(1, 1, 1, 1));
             continue;
         }
-        SetText(g_rowText[r], it->label);
+        SetText(g_rowText[r], RowLabel(it));
         SetColor(g_rowCube[r].get(), r == g_flashRow ? Color(1, 0.9f, 0.6f, 1) : on ? T().buttonOn : T().button);
         if (Alive(g_rowText[r].get())) G.graphicSetColor[g_rowText[r].get()](on ? Color(1, 1, 1, 1) : T().title);
     }
@@ -1213,7 +1254,8 @@ static void PlaceMenu() {
         // Move the menu object itself and keep the panel at its center (local values only:
         // the menu object is scaled down to nothing for the pop-open, and setting a world
         // position under a zero scale sends the panel off to nowhere).
-        G.trSetLocalScale[t](Vector3(1, 1, 1));
+        float ms = MenuScale();
+        G.trSetLocalScale[t](Vector3(ms, ms, ms));
         G.trSetPosition[t](center);
         G.trSetRotation[t](Quaternion::LookRotation(tilt));
         G.trSetLocalPosition[bt](Vector3(0, 0, 0));
@@ -1312,10 +1354,44 @@ static void Buzz() {
 
 static void CheckPress() {
     int hit = Touching();
+    {                                                     // Menu Size slider: follow the finger along the button
+        int si = g_page * kRows + hit;
+        bool onSlider = hit >= 0 && hit < kRows && si < (int)g_view.size() && g_view[si]->fn == NextMenuSize;
+        if (onSlider) {
+            Vector3 p = G.trInverseTransformPoint[Tr(g_board.get())](G.trGetPosition[Tr(g_pointer.get())]());
+            float t = (p.x - (RowX(hit) - kBtnW / 2)) / kBtnW;
+            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            int pct = 50 + (int)(t * 20 + 0.5f) * 5;       // 50..150 in steps of 5
+            if (!g_sliding) { g_sliding = true; g_slidePct = -1; }
+            if (pct != g_slidePct) {
+                if (g_slidePct >= 0) Buzz();
+                g_slidePct = pct;
+                PlaceKnob(hit);
+                char tip[96];
+                snprintf(tip, sizeof tip, "Menu Size: %d%% (let go to resize)", pct);
+                SetText(g_tipText, tip);
+            }
+            g_hover = hit;
+            g_touching = hit;
+            return;
+        }
+        if (g_sliding) {                                  // finger lifted: resize now and save
+            g_sliding = false;
+            if (g_slidePct >= 50) g_menuPct = g_slidePct;
+            g_dirty = true;
+            Notify("Menu size: %d%%", g_menuPct);
+            try { SaveSettings(); } catch (...) {}
+        }
+    }
     if (hit != g_hover) {                                 // tooltip for the button under your finger
         g_hover = hit;
         int i = g_page * kRows + hit;
         if (hit >= 0 && hit < kRows && i < (int)g_view.size()) SetText(g_tipText, TipFor(g_view[i]->label));
+        if (hit >= 0 && hit < kRows && i < (int)g_view.size() && g_view[i]->fn == NextMenuSize) {
+            char tip[96];
+            snprintf(tip, sizeof tip, "Menu Size: %d%% (slide the circle)", g_menuPct);
+            SetText(g_tipText, tip);
+        }
     }
     if (hit != -2 && hit != g_touching && g_time >= g_nextPress) {   // one press per touch
         g_nextPress = g_time + 0.25;
@@ -1340,9 +1416,11 @@ static void CheckPress() {
 
 static void AnimateMenu() {
     float open = (float)(g_time - g_openTime) / 0.15f;     // pop open like ii's menu
-    if (open <= 1.05f && Alive(g_menu.get())) {
-        float k = open >= 1 ? 1 : 1 - (1 - open) * (1 - open);
+    static int shownPct = -1;
+    if ((open <= 1.05f || shownPct != g_menuPct) && Alive(g_menu.get())) {
+        float k = (open >= 1 ? 1 : 1 - (1 - open) * (1 - open)) * MenuScale();
         G.trSetLocalScale[Tr(g_menu.get())](Vector3(k, k, k));
+        if (open > 1.05f) shownPct = g_menuPct;
     }
     if (g_flashRow != -2 && g_time >= g_flashUntil) { g_flashRow = -2; g_dirty = true; }
     float t = 0.5f + 0.5f * sinf((float)g_time * 2.0f);
@@ -2240,7 +2318,7 @@ static bool g_onHandTrigger = false;
 // item prefabs that aren't in the room), one entry per item kind. Built when the page opens.
 static std::vector<std::string> g_seenKeys;               // every item kind seen this session (grows as you play)
 static void SeeKey(const std::string &key) {
-    if (key.empty() || key.size() >= 60 || g_seenKeys.size() >= 1000) return;
+    if (key.empty() || key.size() >= 60 || g_seenKeys.size() >= 3000) return;
     for (auto &k : g_seenKeys) if (k == key) return;
     g_seenKeys.push_back(key);
 }
@@ -2550,6 +2628,11 @@ static int ReadNetLists() {
 // confirmed real (like one you held or spawned).
 static int g_classListsUsed = 0;
 static std::string g_listFrom;
+static std::vector<std::string> g_trustedFrom;            // parts whose list was confirmed real before (saved)
+static bool TrustedFrom(const char *nm) {
+    for (auto &t : g_trustedFrom) if (t == nm) return true;
+    return false;
+}
 static int ReadLoadedLists() {
     Refl &r = Reflection();
     auto Rs = ym::api()->resolve;
@@ -2569,7 +2652,7 @@ static int ReadLoadedLists() {
         !G.findAll.IsValid())
         return 0;
     std::vector<std::string> confirmed = g_seenKeys;
-    if (confirmed.empty()) return 0;
+    if (confirmed.empty() && g_trustedFrom.empty()) return 0;
     std::sort(confirmed.begin(), confirmed.end());
     void *uobjClass = uobj.GetClass();
     auto FieldOff = [&](Il2CppObject *o, std::initializer_list<const char *> names) {
@@ -2656,9 +2739,10 @@ static int ReadLoadedLists() {
                 std::vector<std::string> names;
                 try { Read(*(Il2CppObject **)((uint8_t *)o + fk.first), fk.second, names); } catch (...) { continue; }
                 if (names.size() < 2) continue;
-                bool trusted = false;
-                for (auto &s2 : names) if (std::binary_search(confirmed.begin(), confirmed.end(), s2)) { trusted = true; break; }
+                bool trusted = TrustedFrom(nm);
+                for (auto &s2 : names) if (!trusted && std::binary_search(confirmed.begin(), confirmed.end(), s2)) trusted = true;
                 if (!trusted) continue;
+                if (!TrustedFrom(nm)) g_trustedFrom.push_back(nm);
                 ym::log("clientdabell: item spawner: %s list has %d names, used", nm, (int)names.size());
                 g_classListsUsed++;
                 if (g_listFrom.empty()) g_listFrom = nm;
@@ -2667,6 +2751,48 @@ static int ReadLoadedLists() {
         }
     }
     return added;
+}
+
+// The item list is saved to clientdabell_items.txt next to the mod files, so once it has loaded
+// one time it's there every time after (even right after starting the game, or on a map where
+// the game's list isn't loaded). "#from Name" lines remember which game parts had the real list.
+static std::string ItemsPath() {
+    const char *base = ym::api()->modsDir;
+    return std::string(base ? base : ".") + "/clientdabell_items.txt";
+}
+static size_t g_itemsSaved = 0;
+static void LoadItemCache() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    FILE *f = fopen(ItemsPath().c_str(), "r");
+    if (!f) return;
+    char line[128];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+        if (!len) continue;
+        if (!strncmp(line, "#from ", 6)) { if (!TrustedFrom(line + 6)) g_trustedFrom.push_back(line + 6); continue; }
+        if (line[0] == '#') continue;
+        SeeKey(line);
+        n++;
+    }
+    fclose(f);
+    g_itemsSaved = g_seenKeys.size();
+    ym::log("clientdabell: item spawner: loaded %d saved items", n);
+}
+static void SaveItemCache() {
+    if (g_seenKeys.size() <= g_itemsSaved && g_trustedFrom.empty()) return;
+    if (g_seenKeys.size() < g_itemsSaved) return;          // never shrink the saved list
+    std::string text = "# ClientDaBell item list\n";
+    for (auto &t : g_trustedFrom) text += "#from " + t + "\n";
+    for (auto &k : g_seenKeys) text += k + "\n";
+    FILE *f = fopen(ItemsPath().c_str(), "w");
+    if (!f) { ym::log("clientdabell: couldn't save items to %s", ItemsPath().c_str()); return; }
+    fputs(text.c_str(), f);
+    fclose(f);
+    g_itemsSaved = g_seenKeys.size();
 }
 
 static void ScanCatalog() {
@@ -2681,12 +2807,14 @@ static void ScanCatalog() {
                                                                  : G.findSceneByType((Il2CppObject *)G.tItem, 0)), errors);
         } catch (...) { errors++; }
     }
+    try { LoadItemCache(); } catch (...) { errors++; }   // everything found on earlier days
     if (g_itemKey[0]) SeeKey(g_itemKey);                 // the last item you held
     int defs = 0, fromNet = 0;
     try { FindItemDefinitions(); defs = ReadItemDefinitions(); } catch (...) { errors++; }
     try { fromNet = ReadNetLists(); } catch (...) { errors++; }
     int fromParts = 0;
     try { fromParts = ReadLoadedLists(); } catch (...) { errors++; }
+    try { SaveItemCache(); } catch (...) { errors++; }
     std::vector<std::string> keys = g_seenKeys;
     std::sort(keys.begin(), keys.end());
     g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
@@ -2699,13 +2827,32 @@ static void ScanCatalog() {
     ym::log("clientdabell: item spawner: %d new from %d game lists, %d new from %d part lists (%s)", fromNet, g_netListsUsed,
             fromParts, g_classListsUsed, g_listFrom.c_str());
     int lists = g_netListsUsed + g_classListsUsed;
-    if (g_seenKeys.empty() || (!g_defFound && lists == 0))
+    if (g_seenKeys.empty() || (!g_defFound && lists == 0 && g_trustedFrom.empty()))
         Notify("%d items (lists=0; hold or spawn an item, then reopen)", (int)g_catalog.size());
     else if (!g_listFrom.empty()) Notify("%d items (lists=%d, from %s)", (int)g_catalog.size(), lists, g_listFrom.c_str());
     else Notify("%d items (lists=%d)", (int)g_catalog.size(), lists);
 }
 // Tapping an item in the list: one of it appears 80 cm in front of you. Same limits as
 // Spawn On Hand: one every 0.3 s, through the item queue (2 sent per frame, 32 waiting at most).
+static char g_checkKey[64] = "";
+static int g_checkBefore = -1;
+static double g_checkAt = 0;
+// How many of this item are in the room right now (-1 if it can't tell).
+static int CountInRoom(const char *key) {
+    if (!G.tItem || !G.itemKey.IsValid() || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return -1;
+    uint8_t *arr = nullptr;
+    try {
+        arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem) : G.findSceneByType((Il2CppObject *)G.tItem, 0));
+    } catch (...) { return -1; }
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    int c = 0;
+    for (size_t i = 0; i < n && i < 5000; i++) {
+        Il2CppObject *o = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(o)) continue;
+        try { auto *k = G.itemKey[o](); if (k && k->str() == key) c++; } catch (...) {}
+    }
+    return c;
+}
 static void SpawnPicked() {
     Item *it = g_lastPressed;
     Il2CppObject *head = g_head.get();
@@ -2714,9 +2861,29 @@ static void SpawnPicked() {
     if (g_itemQueue.size() >= 32) { Notify("Wait a moment"); return; }
     g_nextItem = g_time + 0.3;
     snprintf(g_itemKey, sizeof g_itemKey, "%s", g_catalog[it - &g_spawnView[0]].c_str());
+    // 1.5 m out, level with your head (flat forward): big blocks like 4x4 doors don't land
+    // inside you or the floor, which can make the game drop them.
     Vector3 f = G.trGetForward[head]();
-    g_itemQueue.push_back({G.trGetPosition[head]() + f * 0.8f + Vector3(0, -0.2f, 0), Vector3(0, 0, 0)});
-    Notify("Spawned %.40s", g_itemKey);
+    f.y = 0;
+    float fl = sqrtf(f.x * f.x + f.z * f.z);
+    f = fl > 1e-4f ? f * (1.0f / fl) : Vector3(0, 0, 1);
+    g_checkBefore = CountInRoom(g_itemKey);
+    snprintf(g_checkKey, sizeof g_checkKey, "%s", g_itemKey);
+    g_checkAt = g_time + 3.0;
+    g_itemQueue.push_back({G.trGetPosition[head]() + f * 1.5f, Vector3(0, 0, 0)});
+    Notify("Spawning %.40s", g_itemKey);
+}
+// 3 s after a spawn: if there isn't one more of it in the room, say so (instead of "Spawned").
+static void SpawnCheckTick() {
+    if (g_checkAt <= 0 || g_time < g_checkAt) return;
+    g_checkAt = 0;
+    int now = CountInRoom(g_checkKey);
+    if (now < 0 || g_checkBefore < 0) return;             // couldn't look
+    if (now > g_checkBefore) Notify("Spawned %.40s", g_checkKey);
+    else {
+        Notify("%.40s didn't show up (the game blocked it)", g_checkKey);
+        ym::log("clientdabell: item spawner: %s did not appear (before %d, after %d)", g_checkKey, g_checkBefore, now);
+    }
 }
 
 static void SpawnOnHandTick(const Buttons &in) {
@@ -4408,6 +4575,13 @@ static void TodTick() {
 // the way it sees any pose: the game sends your hands as usual and nothing extra goes out.
 static const float kArmScales[] = {1.5f, 2.0f, 3.0f, 4.0f};
 static int g_armScale = 1;
+static void NextMenuSize() {
+    static const int steps[] = {75, 100, 125, 150};
+    int next = steps[0];
+    for (int st : steps) if (st > g_menuPct) { next = st; break; }
+    g_menuPct = next;
+    Notify("Menu size: %d%%", g_menuPct);
+}
 static void NextArmLength() { g_armScale = (g_armScale + 1) % 4; Notify("Arm length: %.1fx", kArmScales[g_armScale]); }
 
 // To stretch an arm the controller trackers have to be paused (they would put the hand back),
@@ -4826,7 +5000,7 @@ struct BoolSetting { const char *name; bool *v; };
 static const IntSetting kIntSettings[] = {
     {"theme", &g_theme, kThemeCount}, {"pointer", &g_pointerSpot, 4}, {"ironSpeed", &g_ironSpeed, 4},
     {"carSpeed", &g_carSpeed, 3}, {"soundVolume", &g_soundVol, 3}, {"effectIntensity", &g_wxIntensity, 3},
-    {"armLength", &g_armScale, 4}, {"jumpPower", &g_jumpPower, 4},
+    {"armLength", &g_armScale, 4}, {"jumpPower", &g_jumpPower, 4}, {"menuScale", &g_menuPct, 151},
 };
 static const BoolSetting kBoolSettings[] = {
     {"rightHandMenu", &f_rightHand}, {"barkMode", &f_barkMode}, {"rainbowMenu", &f_rainbow}, {"colorBlindMode", &f_colorBlind},
@@ -4966,7 +5140,7 @@ static void OnUpdate(float dt) {
     TeleportGunTick(in);
     try { ItemOrbitTick(dt); }
     catch (...) { f_itemOrbit = false; try { OrbitRelease(); } catch (...) {} ym::log("clientdabell: item orbit error, turned off"); }
-    try { SpawnOnHandTick(in); ItemQueueTick(); }
+    try { SpawnOnHandTick(in); ItemQueueTick(); SpawnCheckTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
     try { DisableSongsTick(); }
     catch (...) { f_disableSongs = false; try { DisableSongsReset(); } catch (...) {} ym::log("clientdabell: disable songs error, turned off"); }
