@@ -2000,9 +2000,12 @@ static bool SendItem(const char *key, Vector3 pos, Quaternion rot, Vector3 vel, 
         } else if (tn == "UnityEngine.Quaternion") {
             v = G.valueBox(k, &rot);
         } else if (tn == "System.String[]") {
-            int n = extra ? (int)g_extraArr.size() : 0;
+            // The block's info goes in the text list: its own text list if it has one, or else its
+            // texts in order (a 1x1 pillow: "1x1_stuffed", "orange" - which block, which color).
+            const std::vector<std::string> &src = !g_extraArr.empty() ? g_extraArr : g_extraStr;
+            int n = extra ? (int)src.size() : 0;
             auto *arr = (uint8_t *)G.arrayNew(G.stringClass, n);
-            for (int j = 0; arr && j < n; j++) ((Il2CppObject **)(arr + 0x20))[j] = (Il2CppObject *)CreateMonoString(g_extraArr[j].c_str());
+            for (int j = 0; arr && j < n; j++) ((Il2CppObject **)(arr + 0x20))[j] = (Il2CppObject *)CreateMonoString(src[j].c_str());
             v = arr;
         } else if (k && k->byval_arg.valuetype) {
             uint8_t raw[64] = {};
@@ -2583,6 +2586,17 @@ static void ScanBlocks() {
     };
     // The item you're holding (either hand), first: every value stored on it and on each part of
     // its object ("H:" lines), so we can see where a building block keeps which block it is.
+    if (auto *mi = G.rpcCreateItem) {                     // what the spawn message carries, in order
+        std::string sig;
+        for (int i = 0; i < mi->parameters_count && i < 16; i++) {
+            Class pc(mi->parameters[i]);
+            auto *k = pc.IsValid() ? pc.GetClass() : nullptr;
+            std::string tn = Short(TypeName(mi->parameters[i]));
+            if (tn.size() > 18) tn = k && k->byval_arg.valuetype ? (k->enumtype ? "enum" : "struct") : "class";
+            sig += (i ? "," : "") + tn;
+        }
+        for (size_t at = 0; at < sig.size(); at += 80) Add("R: " + sig.substr(at, 80));
+    }
     g_handItemObj = nullptr;
     if (HeldItemKey(g_leftHand.get()) || HeldItemKey(g_rightHand.get())) {
         Il2CppObject *held = g_handItemObj;
@@ -3051,7 +3065,19 @@ static std::string FindPillowKey() {
 static std::vector<PendingItem> g_houseLeft;
 static char g_houseKey[64] = "";
 static int g_houseBatch = 0, g_houseBatches = 0;
+static int CountInRoom(const char *key);
+static int g_houseBefore = -1, g_houseTotal = 0;
+static double g_houseCheckAt = 0;
 static void PillowHouseTick() {
+    if (g_houseCheckAt > 0 && g_time >= g_houseCheckAt) {   // 4 s after the last batch: how many really showed up
+        g_houseCheckAt = 0;
+        int now = CountInRoom(g_houseKey);
+        if (now >= 0 && g_houseBefore >= 0) {
+            int got = now - g_houseBefore;
+            Notify("Pillow house: %d of %d showed up", got < 0 ? 0 : got, g_houseTotal);
+            ym::log("clientdabell: pillow house %s: %d of %d showed up (before %d, after %d)", g_houseKey, got, g_houseTotal, g_houseBefore, now);
+        }
+    }
     if (g_houseLeft.empty() || g_time < g_nextBatch || !g_itemQueue.empty()) return;
     snprintf(g_itemKey, sizeof g_itemKey, "%s", g_houseKey);   // keep building with the pillow
     size_t n = std::min<size_t>(25, g_houseLeft.size());
@@ -3059,7 +3085,7 @@ static void PillowHouseTick() {
     g_houseLeft.erase(g_houseLeft.begin(), g_houseLeft.begin() + n);
     QueueItems(batch);
     g_houseBatch++;
-    if (g_houseLeft.empty()) Notify("Pillow house done!");
+    if (g_houseLeft.empty()) { Notify("Pillow house sent, checking..."); g_houseCheckAt = g_time + 4.0; }
     else Notify("Building pillow house %d/%d (%.20s %.30s)", g_houseBatch, g_houseBatches, g_houseKey,
                 g_extraKey == g_houseKey ? g_extraShow.c_str() : "");
 }
@@ -3112,6 +3138,9 @@ static void PillowHouse() {
     for (int z = -half; z <= half; z++)                  // roof
         for (int x = -half; x <= half; x++) Add(x, wallH, z, faceYou);
     g_houseLeft = list;
+    g_houseTotal = (int)list.size();
+    g_houseBefore = CountInRoom(g_houseKey);
+    g_houseCheckAt = 0;
     g_houseBatch = 0;
     g_houseBatches = (int)((list.size() + 24) / 25);
     Notify("Building with %.40s", g_houseKey);
