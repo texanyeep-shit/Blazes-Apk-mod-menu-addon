@@ -461,6 +461,7 @@ static Buttons ReadButtons() {
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
 static bool f_itemGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash, f_itemOrbit;
+static bool f_autoPlay = false;                  // Soundboard: when a song ends, play the next one
 static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_overlap = false;                  // Play while a song plays mixes the two together
 static bool f_disableSongs = false;             // mute other players while they play music
@@ -473,7 +474,7 @@ static bool g_barkOpen = false;                 // Bark Mode: the panel is open 
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
-struct PendingItem { Vector3 pos, vel; bool drop = false, orbit = false; Quaternion rot = Quaternion(0, 0, 0, 1); };   // once it appears: drop it (Item Rain) / add it to Item Orbit
+struct PendingItem { Vector3 pos, vel; bool drop = false, orbit = false; Quaternion rot = Quaternion(0, 0, 0, 1); bool freeze = false; };   // once it appears: drop it (Item Rain) / add it to Item Orbit
 static std::vector<PendingItem> g_itemQueue;
 static double g_nextItem = 0, g_nextBatch = 0;
 static int g_dupeArmed = 0;
@@ -623,6 +624,7 @@ static Item g_items[] = {
     {SOUNDBOARD, "Stop Sound", ACTION, MAIN, nullptr, StopSound},
     {SOUNDBOARD, "Others Hear It", TOGGLE, MAIN, &f_soundMic, SoundMicToggled},
     {SOUNDBOARD, "Loop", TOGGLE, MAIN, &f_soundLoop, ApplyLoop},
+    {SOUNDBOARD, "Auto Play", TOGGLE, MAIN, &f_autoPlay},
     {SOUNDBOARD, "Overlap Songs", TOGGLE, MAIN, &f_overlap},
     {SOUNDBOARD, "Disable Songs", TOGGLE, MAIN, &f_disableSongs, DisableSongsToggled},
     {SOUNDBOARD, "Sound Volume", ACTION, MAIN, nullptr, NextSoundVolume},
@@ -740,7 +742,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
     {"Game Finder", "Shows how the game stores items and blocks (for the full item list). Send a video of all its pages."},
     {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
-    {"Pillow House", "Builds a big house out of pillows 3.5 m in front of you (71 pillows, a few seconds). Everyone sees it."},
+    {"Pillow House", "Builds a big house out of pillows in front of you (71 pillows, a few seconds). Everyone sees it."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
@@ -757,6 +759,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Previous Song", "Picks the previous song in the list."},
     {"Stop Sound", "Stops the song (and cancels a loading one)."},
     {"Loop", "Repeats the song until you stop it."},
+    {"Auto Play", "When a song ends, the next song starts by itself (Loop has to be off)."},
     {"Overlap Songs", "On: Play while a song plays adds the new song on top. Both go through voice chat."},
     {"Disable Songs", "Mutes a player for you while they play music, unmutes them when it stops. A guess, by how steady the sound is."},
     {"Sound Volume", "Quiet, medium or loud (for you; others hear it at full)."},
@@ -2033,19 +2036,40 @@ static void QueueItems(const std::vector<PendingItem> &list) {
 // Item Rain: the game spawns items floating where they appear, so each rained item is found
 // once it exists (by its ID) and dropped: the game's own drop call, then gravity on and a
 // push down. The scene search runs 4 times a second, only while items are waiting.
-struct DropWatch { char id[8]; double until; bool orbit; Vector3 pos; };
+struct DropWatch { char id[8]; double until; bool orbit; Vector3 pos; bool freeze; Quaternion rot; };
 static void OrbitAdd(Il2CppObject *it);
 static bool OrbitHas(Il2CppObject *it);
 static std::vector<DropWatch> g_dropWatch;
 static double g_nextDropScan = 0;
-static void DropWatchAdd(const char *id, bool orbit = false, Vector3 pos = Vector3(0, 0, 0)) {
+static void DropWatchAdd(const char *id, bool orbit = false, Vector3 pos = Vector3(0, 0, 0), bool freeze = false,
+                         Quaternion rot = Quaternion(0, 0, 0, 1)) {
     if (g_dropWatch.size() >= 64) return;
     DropWatch w{};
     snprintf(w.id, sizeof w.id, "%s", id);
-    w.until = g_time + 4.0;
+    w.until = g_time + 5.0;
     w.orbit = orbit;
     w.pos = pos;
+    w.freeze = freeze;
+    w.rot = rot;
     g_dropWatch.push_back(w);
+}
+// Pillow House: hold a spawned item still exactly where it was meant to go (physics off for it,
+// put back in its spot), so the walls stand instead of tumbling into a pile.
+static std::vector<Il2CppObject *> g_frozen;               // pillows already put in place (only compared, never used)
+static void FreezeItem(Il2CppObject *it, Vector3 pos, Quaternion rot) {
+    if (g_frozen.size() > 400) g_frozen.erase(g_frozen.begin(), g_frozen.begin() + 200);
+    g_frozen.push_back(it);
+    Il2CppObject *go = G.compGameObject[it]();
+    Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go](G.tRigidbody) : nullptr;
+    if (!rb && go && G.getComponentsInChildren.IsValid()) {
+        auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tRigidbody, true);
+        if (arr && *(uintptr_t *)(arr + 0x18) > 0) rb = ((Il2CppObject **)(arr + 0x20))[0];
+    }
+    if (Alive(rb)) {
+        if (G.rbSetVelocity.IsValid()) G.rbSetVelocity[rb](Vector3(0, 0, 0));
+        if (G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);
+    }
+    if (Il2CppObject *t = G.compTransform[it]()) { G.trSetPosition[t](pos); G.trSetRotation[t](rot); }
 }
 static void DropItem(Il2CppObject *it) {
     try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}
@@ -2072,6 +2096,7 @@ static void DropWatchTick() {
     for (size_t i = 0; i < n && !g_dropWatch.empty(); i++) {
         Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
         if (!Alive(it) || OrbitHas(it)) continue;
+        if (std::find(g_frozen.begin(), g_frozen.end(), it) != g_frozen.end()) continue;   // already placed
         auto *s = G.itemId[it]();
         std::string id = s ? s->str() : "";
         // Matched by its ID; or, if the game gave it a different ID, by being the same kind of
@@ -2089,10 +2114,12 @@ static void DropWatchTick() {
                     ip = G.trGetPosition[G.compTransform[it]()]();
                 }
                 Vector3 d = ip - g_dropWatch[k].pos;
-                match = sameKind && d.x * d.x + d.y * d.y + d.z * d.z < 0.4f * 0.4f;
+                float r = g_dropWatch[k].freeze ? 0.6f : 0.4f;   // a house pillow may have slid a bit already
+                match = sameKind && d.x * d.x + d.y * d.y + d.z * d.z < r * r;
             }
             if (!match) continue;
             if (g_dropWatch[k].orbit) OrbitAdd(it);
+            else if (g_dropWatch[k].freeze) FreezeItem(it, g_dropWatch[k].pos, g_dropWatch[k].rot);
             else DropItem(it);
             g_dropWatch.erase(g_dropWatch.begin() + k);
             break;
@@ -2106,7 +2133,7 @@ static void ItemQueueTick() {
         g_itemQueue.erase(g_itemQueue.begin());
         char id[8] = {};
         bool ok = SendItem(g_itemKey, p.pos, p.rot, p.vel, id);
-        if (ok && (p.drop || p.orbit)) DropWatchAdd(id, p.orbit, p.pos);
+        if (ok && (p.drop || p.orbit || p.freeze)) DropWatchAdd(id, p.orbit, p.pos, p.freeze, p.rot);
         static int logged = 0;
         if (logged++ < 3) ym::log("clientdabell: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
         if (!ok) { g_itemQueue.clear(); Notify("Item spawning isn't ready in this room"); }
@@ -2841,12 +2868,26 @@ static void ScanCatalog() {
 // doorway facing you and a flat roof (71 pillows). Spawned items float where they appear, so the
 // house stays standing. The pillow is the game's own pillow item (the first item name with
 // "pillow" in it, from the Item Spawner list), or the item in your left hand.
+// One plain 1x1 pillow block: names with "pillow" in them, but never bombs or other things that
+// make a bunch of pillows (piles, stacks, forts, spawners...). A name with "1x1" in it wins.
+static bool IsNotPlainPillow(const std::string &low) {
+    for (const char *w : {"bomb", "grenade", "explo", "launcher", "gun", "cannon", "trap", "mine", "blast", "boom", "nuke",
+                          "rocket", "pile", "stack", "fort", "pack", "bundle", "spawn", "box", "bag", "dispens", "crate",
+                          "group", "multi", "many", "heap", "chest", "machine", "station", "rack", "shelf", "fight"})
+        if (low.find(w) != std::string::npos) return true;
+    return false;
+}
 static std::string FindPillowKey() {
     std::string best;
+    int bestScore = -1;
     for (auto &k : g_seenKeys) {
         std::string low = k;
         for (auto &c : low) c = (char)tolower((unsigned char)c);
-        if (low.find("pillow") != std::string::npos && (best.empty() || k.size() < best.size())) best = k;
+        if (low.find("pillow") == std::string::npos || IsNotPlainPillow(low)) continue;
+        int score = (low == "pillow" ? 5000 : 0)            // the item named just "pillow" always wins
+                  + (low.find("1x1") != std::string::npos ? 1000 : 0) + (low.find("block") != std::string::npos ? 100 : 0)
+                  + (60 - (int)k.size());                // then the shortest
+        if (score > bestScore) { bestScore = score; best = k; }
     }
     return best;
 }
@@ -2864,33 +2905,38 @@ static void PillowHouseTick() {
     QueueItems(batch);
     g_houseBatch++;
     if (g_houseLeft.empty()) Notify("Pillow house done!");
-    else Notify("Building pillow house %d/%d", g_houseBatch, g_houseBatches);
+    else Notify("Building pillow house %d/%d (%.30s)", g_houseBatch, g_houseBatches, g_houseKey);
 }
 static void PillowHouse() {
     Il2CppObject *head = g_head.get();
     if (!head) return;
     if (!g_houseLeft.empty()) { Notify("Still building the last one"); return; }
-    std::string key = FindPillowKey();
+    // A pillow in your left hand comes first (that's surely one single pillow), then the item list.
+    std::string key;
+    if (LeftHandItem()) {
+        std::string low = g_itemKey;
+        for (auto &c : low) c = (char)tolower((unsigned char)c);
+        if (low.find("pillow") != std::string::npos && !IsNotPlainPillow(low)) key = g_itemKey;   // only a plain pillow
+    }
     if (key.empty()) {
-        try { LoadItemCache(); } catch (...) {}          // the saved item list may have one
         key = FindPillowKey();
+        if (key.empty()) { try { LoadItemCache(); } catch (...) {} key = FindPillowKey(); }
     }
-    if (key.empty()) {
-        if (!LeftHandItem()) { Notify("Hold a pillow in your left hand (or open Item Spawner once), then try again"); return; }
-        key = g_itemKey;
-    }
+    if (key.empty()) { Notify("Hold one 1x1 pillow in your left hand, then try again"); return; }
     snprintf(g_houseKey, sizeof g_houseKey, "%s", key.c_str());
+    ym::log("clientdabell: pillow house uses %s", g_houseKey);
     // 5 x 5 pillows across, walls 3 high with a doorway (1 wide, 2 high) facing you, a 5 x 5 roof.
-    const float gap = 0.5f;                              // pillow spacing
+    const float gap = 0.82f;                             // pillow spacing (Yeeps pillows are about 80 cm)
     const int half = 2, wallH = 3;
     Vector3 f = Flat(G.trGetForward[head]()), r = Cross(Vector3(0, 1, 0), f);
     Vector3 hp = G.trGetPosition[head]();
-    Vector3 center = hp + f * 3.5f + Vector3(0, -1.2f, 0);   // floor level-ish, 3.5 m out
+    Vector3 center = hp + f * 5.0f + Vector3(0, -1.0f, 0);   // near the floor, 5 m out (the front wall is about 3.4 m away)
     Quaternion faceYou = Quaternion::LookRotation(f), side = Quaternion::LookRotation(r);
     std::vector<PendingItem> list;
     auto Add = [&](int x, int y, int z, Quaternion q) {
         PendingItem p{center + r * (x * gap) + f * (z * gap) + Vector3(0, y * gap, 0), Vector3(0, 0, 0)};
         p.rot = q;
+        p.freeze = true;
         list.push_back(p);
     };
     for (int y = 0; y < wallH; y++)                      // walls, bottom row first
@@ -2906,7 +2952,7 @@ static void PillowHouse() {
     g_houseLeft = list;
     g_houseBatch = 0;
     g_houseBatches = (int)((list.size() + 24) / 25);
-    if (g_time < g_nextBatch) Notify("Pillow house starts in a moment");
+    Notify("Building with %.40s", g_houseKey);
     PillowHouseTick();
 }
 static char g_checkKey[64] = "";
@@ -3320,7 +3366,21 @@ static bool SongStillPlaying() {
 
 // Every frame: send the song again after "Others Hear It" comes back on, check that a song
 // that was just sent really goes out, and give the mic back when it's over.
+// Auto Play: a song that was playing has just ended on its own (not stopped, not looping, not
+// still loading): go to the next song and play it. Works with Others Hear It too, since the next
+// song is played the same way as pressing Play.
+static void AutoPlayTick() {
+    static bool wasPlaying = false;
+    bool playing = SongStillPlaying();
+    bool ended = wasPlaying && !playing;
+    wasPlaying = playing;
+    if (!f_autoPlay || f_soundLoop || !ended || !g_songPlaying || g_load.f || g_songs.size() < 1) return;
+    NextSong();
+    PlaySong();
+    Notify("Next song: %.40s", SongTitle(g_songSel).c_str());
+}
 static void SoundTick() {
+    try { AutoPlayTick(); } catch (...) {}
     if (g_micResumeAt > 0 && g_time >= g_micResumeAt) {
         g_micResumeAt = 0;
         g_micRound = 0;
@@ -5146,7 +5206,7 @@ static const IntSetting kIntSettings[] = {
 };
 static const BoolSetting kBoolSettings[] = {
     {"rightHandMenu", &f_rightHand}, {"barkMode", &f_barkMode}, {"rainbowMenu", &f_rainbow}, {"colorBlindMode", &f_colorBlind},
-    {"showFps", &f_fps}, {"showClock", &f_clock}, {"notifications", &f_notify}, {"othersHearIt", &f_soundMic},
+    {"showFps", &f_fps}, {"autoPlay", &f_autoPlay}, {"showClock", &f_clock}, {"notifications", &f_notify}, {"othersHearIt", &f_soundMic},
 };
 static std::string g_lastSaved;
 static void SaveSettings() {
