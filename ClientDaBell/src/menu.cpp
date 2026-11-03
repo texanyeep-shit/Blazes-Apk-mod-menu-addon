@@ -498,7 +498,7 @@ static std::vector<PendingItem> g_itemQueue;
 static double g_nextItem = 0, g_nextBatch = 0;
 static int g_dupeArmed = 0;
 
-static constexpr int kDances = 26;                 // 0-7 Rig Mods dances, 8-25 Emotes
+static constexpr int kDances = 27;                 // 0-7 Rig Mods dances, 8-25 Emotes
 static bool g_danceSel[kDances];
 static bool g_wxSel[5];             // Effects: Snow, Rain, Thunderstorm, Disco, Bundle Disco (pick one, like the dances)
 static int g_wx = -1;
@@ -600,7 +600,6 @@ static Item g_items[] = {
     {MAIN, "Emotes", OPEN, EMOTES},
     {MAIN, "Visual Mods", OPEN, VISUAL},
     {MAIN, "Fun Mods", OPEN, FUN},
-    {MAIN, "Info Tools", OPEN, INFO},
     {MAIN, "Search", OPEN, SEARCH},
     {MAIN, "Credits", OPEN, CREDITS},
     {MAIN, "Beta Testers", OPEN, BETA},
@@ -643,6 +642,7 @@ static Item g_items[] = {
     {EMOTES, "Arm Raise", TOGGLE, MAIN, &g_danceSel[23], DancePicked},
     {EMOTES, "Side Raise", TOGGLE, MAIN, &g_danceSel[24], DancePicked},
     {EMOTES, "Arc", TOGGLE, MAIN, &g_danceSel[25], DancePicked},
+    {EMOTES, "67", TOGGLE, MAIN, &g_danceSel[26], DancePicked},
     {RIG, "Exit Rig Mods", OPEN, MAIN},
     {RIG, "Wave", TOGGLE, MAIN, &g_danceSel[0], DancePicked},
     {RIG, "Helicopter", TOGGLE, MAIN, &g_danceSel[1], DancePicked},
@@ -667,8 +667,6 @@ static Item g_items[] = {
     {ITEMS, "Item Circle", ACTION, MAIN, nullptr, ItemCircle},
     {ITEMS, "Item Orbit", TOGGLE, MAIN, &f_itemOrbit, ItemOrbitToggled},
     {ITEMS, "Item Heart", ACTION, MAIN, nullptr, ItemHeart},
-    {ITEMS, "Item Ring", ACTION, MAIN, nullptr, ItemRing},
-    {ITEMS, "Item Aura", TOGGLE, MAIN, &f_itemAura, ItemAuraToggled},
     {ITEMS, "Item Shapes", OPEN, SHAPES},
 
     {VISUAL, "Exit Visual Mods", OPEN, MAIN},
@@ -676,21 +674,11 @@ static Item g_items[] = {
     {VISUAL, "Full Bright", TOGGLE, MAIN, &f_fullBright},
     {VISUAL, "Rainbow Sky", TOGGLE, MAIN, &f_rainbowSky},
     {VISUAL, "Rainbow Flash", TOGGLE, MAIN, &f_rainbowFlash},
-    {VISUAL, "Hand Orbs", TOGGLE, MAIN, &f_handOrbs},
-    {VISUAL, "Orbit Balls", TOGGLE, MAIN, &f_orbitBalls},
-    {VISUAL, "Rainbow Halo", TOGGLE, MAIN, &f_halo},
-    {VISUAL, "Pet Ball", TOGGLE, MAIN, &f_petBall},
-    {VISUAL, "Yeep Copies", TOGGLE, MAIN, &f_copies},
 
     {FUN, "Exit Fun Mods", OPEN, MAIN},
     {FUN, "Slow Mode", TOGGLE, MAIN, &f_slowMo},
     {FUN, "Air Hang", TOGGLE, MAIN, &f_airHang},
 
-    {INFO, "Exit Info Tools", OPEN, MAIN},
-    {INFO, "Show Info", TOGGLE, MAIN, &f_showInfo},
-    {INFO, "Set Point A", ACTION, MAIN, nullptr, SetPointA},
-    {INFO, "Set Point B", ACTION, MAIN, nullptr, SetPointB},
-    {INFO, "Show Distance", ACTION, MAIN, nullptr, ShowDistance},
 
     {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
     {SOUNDBOARD, g_soundLabel, ACTION, MAIN, nullptr, PlaySong},
@@ -815,26 +803,14 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Spawn Item Gun", "Hold an item in your left hand. Right grip aims, trigger spawns it."},
     {"Visual Mods", "Colors and effects that only you see."},
     {"Fun Mods", "Little extras that only change your own game."},
-    {"Info Tools", "Position, speed and a ruler."},
     {"Search", "Search for a mod: tap the keys under the menu."},
     {"No Fog", "Turns the fog off for you."},
     {"Full Bright", "Lights everything up evenly. Only you see it."},
     {"Rainbow Sky", "The sky color cycles through the rainbow. Only you see it."},
     {"Rainbow Flash", "The sky and lights flash in rainbow colors. Only you see it."},
-    {"Hand Orbs", "A glowing rainbow ball in front of each hand. Only you see them."},
-    {"Orbit Balls", "Three rainbow balls circle around you. Only you see them."},
-    {"Rainbow Halo", "A rainbow ring over your head. Only you see it."},
-    {"Pet Ball", "A ball that floats along next to you. Only you see it."},
-    {"Yeep Copies", "10 little Yeep figures walk in a circle around you. Only you see them."},
     {"Slow Mode", "Slows your game down to half speed."},
     {"Air Hang", "Hold B to hang in the air (X if the menu is on your right hand)."},
-    {"Show Info", "Shows your position and speed under the menu."},
-    {"Set Point A", "Marks where you stand as point A."},
-    {"Set Point B", "Marks where you stand as point B."},
-    {"Show Distance", "Tells you how far point A is from point B."},
     {"Item Heart", "Lays your left-hand item out in a heart on the floor in front of you."},
-    {"Item Ring", "Spawns 27 of your left-hand item in rings around you. They stay put."},
-    {"Item Aura", "32 copies of your left-hand item spiral around you. Only you see them."},
     {"Item Shapes", "Heart, shapes, every letter A to Z and every number 0 to 9."},
     {"Hands Up", "Both hands straight up. Hold left trigger."},
     {"Figure 8", "Hands draw figure eights in front of you. Hold left trigger."},
@@ -843,6 +819,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Pump", "One arm pumps up, the other on your hip. Hold left trigger."},
     {"Arm Raise", "Arms go up one after the other. Hold left trigger."},
     {"Side Raise", "Arms go up and down at your sides. Hold left trigger."},
+    {"67", "Six seven: hands out in front, going up and down one after the other. Hold left trigger."},
     {"Arc", "Hands sweep an arc over your head. Hold left trigger."},
     {"Button Buzz", "A small buzz when you press a menu button."},
     {"Spawn Eggs", "Every mob spawn egg in the game. Tap one to spawn it in front of you."},
@@ -2187,6 +2164,12 @@ static void DanceTick(const Buttons &in, float dt) {
         float a = 1.57f + 1.2f * sinf(t * 3);
         R = shoulder + r * (0.6f * cosf(a)) + up * (0.6f * sinf(a)) + f * 0.05f;
         L = shoulder + r * (0.6f * cosf(a + 0.4f)) + up * (0.6f * sinf(a + 0.4f)) + f * 0.05f;
+        break;
+    }
+    case 26: { // 67: both hands out in front at your waist, palms up, going up and down one after the other
+        float b = 0.12f * sinf(t * 9);
+        R = shoulder + f * 0.35f + r * 0.22f - up * 0.15f + up * b;
+        L = shoulder + f * 0.35f - r * 0.22f - up * 0.15f - up * b;
         break;
     }
     default:  // Beyblade: hands spin fast around your waist
