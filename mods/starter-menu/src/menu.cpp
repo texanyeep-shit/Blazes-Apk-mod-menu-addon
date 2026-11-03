@@ -2870,6 +2870,28 @@ static void ScanCatalog() {
 // "pillow" in it, from the Item Spawner list), or the item in your left hand.
 // One plain 1x1 pillow block: names with "pillow" in them, but never bombs or other things that
 // make a bunch of pillows (piles, stacks, forts, spawners...). A name with "1x1" in it wins.
+// The item held in this hand (within 40 cm of it), quietly: sets g_itemKey and says yes, or no.
+static bool HeldItemKey(Il2CppObject *hand) {
+    if (!hand || !G.tItem || !G.itemKey.IsValid() || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return false;
+    auto *arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem)
+                                                  : G.findSceneByType((Il2CppObject *)G.tItem, 0));
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    Vector3 hp = G.trGetPosition[hand]();
+    Il2CppObject *best = nullptr;
+    float bestD = 0.4f * 0.4f;
+    for (size_t i = 0; i < n && i < 5000; i++) {
+        Il2CppObject *it = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(it) || (G.itemHeld.IsValid() && !G.itemHeld[it]())) continue;
+        Vector3 d = G.trGetPosition[G.compTransform[it]()]() - hp;
+        float dd = d.x * d.x + d.y * d.y + d.z * d.z;
+        if (dd < bestD) { bestD = dd; best = it; }
+    }
+    auto *key = best ? G.itemKey[best]() : nullptr;
+    if (!key) return false;
+    snprintf(g_itemKey, sizeof g_itemKey, "%s", key->str().c_str());
+    SeeKey(g_itemKey);
+    return true;
+}
 static bool IsNotPlainPillow(const std::string &low) {
     for (const char *w : {"bomb", "grenade", "explo", "launcher", "gun", "cannon", "trap", "mine", "blast", "boom", "nuke",
                           "rocket", "pile", "stack", "fort", "pack", "bundle", "spawn", "box", "bag", "dispens", "crate",
@@ -2913,16 +2935,22 @@ static void PillowHouse() {
     if (!g_houseLeft.empty()) { Notify("Still building the last one"); return; }
     // A pillow in your left hand comes first (that's surely one single pillow), then the item list.
     std::string key;
-    if (LeftHandItem()) {
+    // Whatever you're holding is used as it is (the game's name for the 1x1 pillow may not even
+    // say "pillow"), unless it's a bomb or something else that blows up into a bunch of things.
+    if (HeldItemKey(g_leftHand.get()) || HeldItemKey(g_rightHand.get())) {   // either hand works
         std::string low = g_itemKey;
         for (auto &c : low) c = (char)tolower((unsigned char)c);
-        if (low.find("pillow") != std::string::npos && !IsNotPlainPillow(low)) key = g_itemKey;   // only a plain pillow
+        bool boom = false;
+        for (const char *w : {"bomb", "grenade", "explo", "blast", "boom", "nuke", "rocket", "launcher"})
+            boom |= low.find(w) != std::string::npos;
+        if (boom) { Notify("%.30s is a bomb, hold a 1x1 pillow instead", g_itemKey); return; }
+        key = g_itemKey;
     }
     if (key.empty()) {
         key = FindPillowKey();
         if (key.empty()) { try { LoadItemCache(); } catch (...) {} key = FindPillowKey(); }
     }
-    if (key.empty()) { Notify("Hold one 1x1 pillow in your left hand, then try again"); return; }
+    if (key.empty()) { Notify("Hold one 1x1 pillow in your hand, then try again"); return; }
     snprintf(g_houseKey, sizeof g_houseKey, "%s", key.c_str());
     ym::log("clientdabell: pillow house uses %s", g_houseKey);
     // 5 x 5 pillows across, walls 3 high with a doorway (1 wide, 2 high) facing you, a 5 x 5 roof.
