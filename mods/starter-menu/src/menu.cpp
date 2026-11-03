@@ -610,7 +610,7 @@ static Item g_items[] = {
     {ITEMS, "Item Spawner", OPEN, SPAWNER},
     {ITEMS, "Game Finder", OPEN, BLOCKS},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
-    {ITEMS, "Steal Item Gun (consenting)", TOGGLE, MAIN, &f_stealGun},
+    {ITEMS, "Item Stealer", TOGGLE, MAIN, &f_stealGun},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
     {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
@@ -1765,7 +1765,7 @@ static void TeleportGunTick(const Buttons &in) {
         if (f_stealGun) {                                 // consenting lobby: grab the item at the ray hit
             if (g_time >= g_nextItem) {
                 g_nextItem = g_time + 0.5;
-                if (!StealItemAt(end, 0)) Notify("No item grabbed");
+                if (!StealItemAt(end, 0)) Notify("No item grabbed"); else Notify("Item moved to hand");
             }
         } else if (f_itemGun) {                            // Spawn Item Gun: an item at that spot
             if (g_time >= g_nextItem && LeftHandItem()) {
@@ -5243,8 +5243,20 @@ static bool GameGrab(Il2CppObject *item, int side) {
 }
 static bool StealItemAt(Vector3 point, int side) {
     Il2CppObject *item = NearestItem(point, 0.75f);
-    if (!item) return false;
-    try { return GameGrab(item, side); } catch (...) { return false; }
+    Il2CppObject *hand = side == 0 ? g_leftHand.get() : g_rightHand.get();
+    if (!item || !hand || !G.trSetParent.IsValid() || !G.trSetLocalPosition.IsValid() || !G.trSetLocalRotation.IsValid()) return false;
+    try { GameGrab(item, side); } catch (...) {}
+    Il2CppObject *t = G.compTransform[item]();
+    if (!t) return false;
+    try {
+        G.trSetParent[t](hand, false);
+        G.trSetLocalPosition[t](Vector3(0, 0, 0));
+        G.trSetLocalRotation[t](Quaternion(0, 0, 0, 1));
+        Il2CppObject *go = G.compGameObject[item]();
+        Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go]((Il2CppObject *)G.tRigidbody) : nullptr;
+        if (Alive(rb) && G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);
+        return true;
+    } catch (...) { return false; }
 }
 static void LongArmsGrabTick(const Buttons &in) {
     for (int i = 0; i < 2; i++) {
