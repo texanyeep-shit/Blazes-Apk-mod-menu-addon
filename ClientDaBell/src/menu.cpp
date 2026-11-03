@@ -785,7 +785,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Thunderstorm", "Rain with lightning and thunder."},
     {"Effect Intensity", "Light, medium or heavy."},
     {"Overpowered", "The overpowered mods. Two pages."},
-    {"Long Arms", "Your arms reach farther, and you can grab items with the long hands. Hands go normal while the menu is open."},
+    {"Long Arms", "Your arms reach farther. Hands go normal while the menu is open."},
     {"Arm Length", "How long the arms are: 1.5x, 2x, 3x or 4x."},
     {"Super Speed", "A lot faster and higher jumps than Speed Boost."},
     {"Mega Jump", "Press B for a huge jump, even in the air. (Y with the right hand menu.)"},
@@ -2770,16 +2770,19 @@ static void ScanBlocks() {
     }
     // "P:" lines: the parts your own Yeep is made of (and how many), to find which one shows
     // your body to the other players (for Ghost Yeep).
-    if (Il2CppObject *me = g_player.get()) {
+    Il2CppObject *meP = g_player.get();
+    if (!meP) Add("P: no player found");
+    if (Il2CppObject *me = meP) try {
         Il2CppObject *go = G.compGameObject[me]();
+        if (!go) Add("P: player has no object");
         Il2CppObject *top = go ? Tr(go) : nullptr;                         // the whole Yeep: start from its top object
-        for (int up = 0; up < 4 && top && G.trGetParent.IsValid(); up++) {
+        for (int up = 0; up < 2 && top && G.trGetParent.IsValid(); up++) {
             Il2CppObject *pt = G.trGetParent[top]();
             if (!pt) break;
             top = pt;
         }
         Il2CppObject *topGo = top ? G.compGameObject[top]() : go;
-        Class comp("UnityEngine", "Component");
+        Class comp("UnityEngine", "MonoBehaviour");              // the game's own scripts
         if (topGo && comp.IsValid() && G.getComponentsInChildren.IsValid()) {
             auto *ca = (uint8_t *)G.getComponentsInChildren[topGo]((Il2CppObject *)comp.GetMonoType(), true);
             size_t n = ca ? *(uintptr_t *)(ca + 0x18) : 0;
@@ -2798,8 +2801,9 @@ static void ScanBlocks() {
             }
             Add("P: your Yeep has " + std::to_string(parts.size()) + " kinds of parts");
             for (size_t i = 0; i < parts.size() && i < 40; i++) Add("P: " + parts[i].first + " x" + std::to_string(parts[i].second));
-        }
-    }
+        } else Add(std::string("P: couldn't list the parts (") + (topGo ? "" : "no object ") + (comp.IsValid() ? "" : "no type ") +
+                   (G.getComponentsInChildren.IsValid() ? "" : "no search") + ")");
+    } catch (...) { Add("P: reading your Yeep failed"); }
     Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
     if (net.IsValid()) Collections("N: ", net.GetClass());
     void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
@@ -3359,7 +3363,13 @@ static void SpawnPicked() {
     g_checkBefore = CountInRoom(g_itemKey);
     snprintf(g_checkKey, sizeof g_checkKey, "%s", g_itemKey);
     g_checkAt = g_time + 3.0;
-    g_itemQueue.push_back({G.trGetPosition[head]() + f * 1.5f, Vector3(0, 0, 0)});
+    PendingItem pi{G.trGetPosition[head]() + f * 1.5f, Vector3(0, 0, 0)};
+    {                                                    // a spawn egg: let it fall and land (that's what hatches it)
+        std::string low = g_itemKey;
+        for (auto &c : low) c = (char)tolower((unsigned char)c);
+        if (low.find("egg") != std::string::npos) { pi.drop = true; pi.pos = G.trGetPosition[head]() + f * 1.5f + Vector3(0, 0.6f, 0); }
+    }
+    g_itemQueue.push_back(pi);
     Notify("Spawning %.40s", g_itemKey);
 }
 // 3 s after a spawn: if there isn't one more of it in the room, say so (instead of "Spawned").
@@ -5178,6 +5188,14 @@ static bool g_laStretch = false;               // fallback: stretch the hand fro
 // Where each hand really is (your controller) and where Long Arms put it, this frame. 0 left, 1 right.
 static Vector3 g_laReal[2], g_laReach[2];
 static bool g_laValid = false;
+// Hands close to your body aren't stretched (smoothly, from 35 to 55 cm out), so you can still
+// reach the inventory bubbles and your own things; reach out farther and the arm gets long.
+static Vector3 LongReach(Vector3 chest, Vector3 hand, float k) {
+    Vector3 d = hand - chest;
+    float dist = sqrtf(Dot(d, d));
+    (void)dist;
+    return chest + d * k;                                // the whole arm stretches, always
+}
 static void LongArmsFail(const char *why) {
     g_laState = 3;
     if (g_laOwns && !g_dancing) PauseTrackers(false);
@@ -5210,9 +5228,10 @@ static void LongArmsTick() {
         int side = 0;
         for (Il2CppObject *h : {lh, rh}) {
             Vector3 before = G.trGetPosition[h]();
-            G.trSetPosition[h](chest + (before - chest) * k);
+            Vector3 to = LongReach(chest, before, k);
+            G.trSetPosition[h](to);
             g_laReal[side] = before;
-            g_laReach[side] = chest + (before - chest) * k;
+            g_laReach[side] = to;
             side++;
             g_laValid = true;
             if (logged < 4) { Vector3 after = G.trGetPosition[h](); ym::log("clientdabell: stretch hand %.2f,%.2f,%.2f -> %.2f,%.2f,%.2f", before.x, before.y, before.z, after.x, after.y, after.z); logged++; }
@@ -5234,12 +5253,12 @@ static void LongArmsTick() {
     if (!ReadController(4, lh, g_laSpaceL, pl, ql) || !ReadController(5, rh, g_laSpaceR, pr, qr)) return;
     Vector3 chest = G.trGetPosition[head]() + Vector3(0, -0.25f, 0);
     float k = kArmScales[g_armScale];
-    G.trSetPosition[lh](chest + (pl - chest) * k);
-    G.trSetRotation[lh](ql);
-    G.trSetPosition[rh](chest + (pr - chest) * k);
-    G.trSetRotation[rh](qr);
     g_laReal[0] = pl; g_laReal[1] = pr;
-    g_laReach[0] = chest + (pl - chest) * k; g_laReach[1] = chest + (pr - chest) * k;
+    g_laReach[0] = LongReach(chest, pl, k); g_laReach[1] = LongReach(chest, pr, k);
+    G.trSetPosition[lh](g_laReach[0]);
+    G.trSetRotation[lh](ql);
+    G.trSetPosition[rh](g_laReach[1]);
+    G.trSetRotation[rh](qr);
     g_laValid = true;
 }
 // Grabbing with Long Arms: the game grabs with where your controller really is, not the long
@@ -5648,7 +5667,6 @@ static void OverpoweredTick(const Buttons &in, float dt) {
     BounceTick();
     ItemGunTick(in, dt);
     LongArmsTick();
-    try { LongArmsGrabTick(in); } catch (...) {}
 }
 static void OverpoweredReset() {                               // room change: the old objects are gone
     g_laTrackersSet = false;
