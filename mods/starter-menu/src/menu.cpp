@@ -2000,9 +2000,12 @@ static bool SendItem(const char *key, Vector3 pos, Quaternion rot, Vector3 vel, 
         } else if (tn == "UnityEngine.Quaternion") {
             v = G.valueBox(k, &rot);
         } else if (tn == "System.String[]") {
-            int n = extra ? (int)g_extraArr.size() : 0;
+            // The block's info goes in the text list: its own text list if it has one, or else its
+            // texts in order (a 1x1 pillow: "1x1_stuffed", "orange" - which block, which color).
+            const std::vector<std::string> &src = !g_extraArr.empty() ? g_extraArr : g_extraStr;
+            int n = extra ? (int)src.size() : 0;
             auto *arr = (uint8_t *)G.arrayNew(G.stringClass, n);
-            for (int j = 0; arr && j < n; j++) ((Il2CppObject **)(arr + 0x20))[j] = (Il2CppObject *)CreateMonoString(g_extraArr[j].c_str());
+            for (int j = 0; arr && j < n; j++) ((Il2CppObject **)(arr + 0x20))[j] = (Il2CppObject *)CreateMonoString(src[j].c_str());
             v = arr;
         } else if (k && k->byval_arg.valuetype) {
             uint8_t raw[64] = {};
@@ -2583,6 +2586,17 @@ static void ScanBlocks() {
     };
     // The item you're holding (either hand), first: every value stored on it and on each part of
     // its object ("H:" lines), so we can see where a building block keeps which block it is.
+    if (auto *mi = G.rpcCreateItem) {                     // what the spawn message carries, in order
+        std::string sig;
+        for (int i = 0; i < mi->parameters_count && i < 16; i++) {
+            Class pc(mi->parameters[i]);
+            auto *k = pc.IsValid() ? pc.GetClass() : nullptr;
+            std::string tn = Short(TypeName(mi->parameters[i]));
+            if (tn.size() > 18) tn = k && k->byval_arg.valuetype ? (k->enumtype ? "enum" : "struct") : "class";
+            sig += (i ? "," : "") + tn;
+        }
+        for (size_t at = 0; at < sig.size(); at += 80) Add("R: " + sig.substr(at, 80));
+    }
     g_handItemObj = nullptr;
     if (HeldItemKey(g_leftHand.get()) || HeldItemKey(g_rightHand.get())) {
         Il2CppObject *held = g_handItemObj;
