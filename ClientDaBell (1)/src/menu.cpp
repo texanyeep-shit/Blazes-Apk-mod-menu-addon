@@ -86,7 +86,7 @@ static struct {
     Method<Vector3> trGetPosition, trGetForward, trGetRight, trGetUp, trInverseTransformPoint, trTransformPoint, rbGetVelocity;
     Method<bool> alive, tryGetBool, haptic, raycast;
     Method<XRDevice> deviceAtNode;
-    Method<Il2CppObject *> trGetParent, trGetRoot, getComponentsInChildren, netLocal;
+    Method<Il2CppObject *> trGetParent, trGetRoot, getComponentsInChildren, netLocal, compGetChildren, goGetChildren1;
     Method<void> pvRpc;
     Method<Il2CppObject *> audioClipCreate;           // soundboard
     Method<bool> audioClipSetData, audioClipGetData;
@@ -305,6 +305,12 @@ static bool Lookups() {
     G.trGetParent = tr.GetMethod("get_parent", 0);
     G.trGetRoot = tr.GetMethod("get_root", 0);
     G.getComponentsInChildren = Overload(go, "GetComponentsInChildren", {"System.Type", "System.Boolean"});
+    // This game build may not keep the GameObject version, so the Component one and the
+    // one-argument GameObject one are kept as backups (see Children()).
+    G.compGetChildren = Overload(Class("UnityEngine", "Component"), "GetComponentsInChildren", {"System.Type", "System.Boolean"});
+    G.goGetChildren1 = Overload(go, "GetComponentsInChildren", {"System.Type"});
+    ym::log("clientdabell: children search: go2=%d comp2=%d go1=%d", G.getComponentsInChildren.IsValid() ? 1 : 0,
+            G.compGetChildren.IsValid() ? 1 : 0, G.goGetChildren1.IsValid() ? 1 : 0);
     Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
     if (net.IsValid()) {
         G.netLocal = net.GetMethod("get_local", 0);
@@ -400,6 +406,18 @@ static bool Lookups() {
 
 static bool Alive(Il2CppObject *o) { return o && G.alive((Il2CppObject *)o); }
 static Il2CppObject *Tr(Il2CppObject *gameObject) { return G.goTransform[gameObject](); }
+// Every part of one kind on an object and its children, by whichever search this game build has.
+static bool HaveChildren() { return G.getComponentsInChildren.IsValid() || G.compGetChildren.IsValid() || G.goGetChildren1.IsValid(); }
+static Il2CppObject *Children(Il2CppObject *go, Il2CppObject *type, bool inactive) {
+    if (!go || !type) return nullptr;
+    if (G.getComponentsInChildren.IsValid()) return G.getComponentsInChildren[go](type, inactive);
+    if (G.compGetChildren.IsValid() && G.goTransform.IsValid()) {
+        Il2CppObject *t = G.goTransform[go]();
+        if (t) return G.compGetChildren[t](type, inactive);
+    }
+    if (G.goGetChildren1.IsValid()) return G.goGetChildren1[go](type);
+    return nullptr;
+}
 static void Show(Ref &r, bool on) { if (Alive(r.get())) G.goSetActive[r.get()](on); }
 static void Kill(Ref &r) { if (Alive(r.get())) G.destroy(r.get()); r.clear(); }
 
@@ -785,7 +803,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Thunderstorm", "Rain with lightning and thunder."},
     {"Effect Intensity", "Light, medium or heavy."},
     {"Overpowered", "The overpowered mods. Two pages."},
-    {"Long Arms", "Reach out and your arms get long (grab items with them). Close to your body they stay normal for the bubbles."},
+    {"Long Arms", "Your arms reach farther. Hands go normal while the menu is open."},
     {"Arm Length", "How long the arms are: 1.5x, 2x, 3x or 4x."},
     {"Super Speed", "A lot faster and higher jumps than Speed Boost."},
     {"Mega Jump", "Press B for a huge jump, even in the air. (Y with the right hand menu.)"},
@@ -1730,8 +1748,8 @@ static void PlayerColliders(bool off) {
         if (!c) continue;
         offOne(c);
         Il2CppObject *rig = G.compGameObject[G.trGetRoot[G.compTransform[c]()]()]();
-        auto *arr = rig && G.getComponentsInChildren.IsValid()
-                        ? (uint8_t *)G.getComponentsInChildren[rig]((Il2CppObject *)G.tCollider, false) : nullptr;
+        auto *arr = rig && HaveChildren()
+                        ? (uint8_t *)Children(rig, (Il2CppObject *)G.tCollider, false) : nullptr;
         size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
         for (size_t i = 0; i < n; i++) offOne(((Il2CppObject **)(arr + 0x20))[i]);
     }
@@ -2124,8 +2142,8 @@ static void FreezeItem(Il2CppObject *it, Vector3 pos, Quaternion rot) {
     g_frozen.push_back(it);
     Il2CppObject *go = G.compGameObject[it]();
     Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go](G.tRigidbody) : nullptr;
-    if (!rb && go && G.getComponentsInChildren.IsValid()) {
-        auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tRigidbody, true);
+    if (!rb && go && HaveChildren()) {
+        auto *arr = (uint8_t *)Children(go, (Il2CppObject *)G.tRigidbody, true);
         if (arr && *(uintptr_t *)(arr + 0x18) > 0) rb = ((Il2CppObject **)(arr + 0x20))[0];
     }
     if (Alive(rb)) {
@@ -2185,8 +2203,8 @@ static void DropItem(Il2CppObject *it) {
     try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}
     Il2CppObject *go = G.compGameObject[it]();
     Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go](G.tRigidbody) : nullptr;
-    if (!rb && go && G.getComponentsInChildren.IsValid()) {
-        auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tRigidbody, true);
+    if (!rb && go && HaveChildren()) {
+        auto *arr = (uint8_t *)Children(go, (Il2CppObject *)G.tRigidbody, true);
         if (arr && *(uintptr_t *)(arr + 0x18) > 0) rb = ((Il2CppObject **)(arr + 0x20))[0];
     }
     if (!Alive(rb)) return;
@@ -2360,8 +2378,8 @@ static double g_orbitAdded[kOrbitMax];
 static Il2CppObject *ItemRigidbody(Il2CppObject *it) {
     Il2CppObject *go = Alive(it) ? G.compGameObject[it]() : nullptr;
     Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go](G.tRigidbody) : nullptr;
-    if (!rb && go && G.getComponentsInChildren.IsValid()) {
-        auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tRigidbody, true);
+    if (!rb && go && HaveChildren()) {
+        auto *arr = (uint8_t *)Children(go, (Il2CppObject *)G.tRigidbody, true);
         if (arr && *(uintptr_t *)(arr + 0x18) > 0) rb = ((Il2CppObject **)(arr + 0x20))[0];
     }
     return Alive(rb) ? rb : nullptr;
@@ -2370,8 +2388,8 @@ static Il2CppObject *ItemRigidbody(Il2CppObject *it) {
 // make the game push it around), back on when it's let go.
 static void ItemCollision(Il2CppObject *it, bool on) {
     Il2CppObject *go = Alive(it) ? G.compGameObject[it]() : nullptr;
-    if (!go || !G.tCollider || !G.colliderSetEnabled.IsValid() || !G.getComponentsInChildren.IsValid()) return;
-    auto *arr = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tCollider, true);
+    if (!go || !G.tCollider || !G.colliderSetEnabled.IsValid() || !HaveChildren()) return;
+    auto *arr = (uint8_t *)Children(go, (Il2CppObject *)G.tCollider, true);
     size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
     for (size_t i = 0; i < n && i < 16; i++) {
         Il2CppObject *c = ((Il2CppObject **)(arr + 0x20))[i];
@@ -2751,8 +2769,8 @@ static void ScanBlocks() {
             Values(held, "H: ");
             Il2CppObject *go = G.compGameObject[held]();
             Class comp("UnityEngine", "Component");
-            if (go && comp.IsValid() && G.getComponentsInChildren.IsValid()) {
-                auto *ca = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)comp.GetMonoType(), true);
+            if (go && comp.IsValid() && HaveChildren()) {
+                auto *ca = (uint8_t *)Children(go, (Il2CppObject *)comp.GetMonoType(), true);
                 size_t n = ca ? *(uintptr_t *)(ca + 0x18) : 0;
                 for (size_t i = 0; i < n && i < 24; i++) {
                     Il2CppObject *cpt = ((Il2CppObject **)(ca + 0x20))[i];
@@ -2782,9 +2800,9 @@ static void ScanBlocks() {
             top = pt;
         }
         Il2CppObject *topGo = top ? G.compGameObject[top]() : go;
-        Class comp("UnityEngine", "Component");
-        if (topGo && comp.IsValid() && G.getComponentsInChildren.IsValid()) {
-            auto *ca = (uint8_t *)G.getComponentsInChildren[topGo]((Il2CppObject *)comp.GetMonoType(), true);
+        Class comp("UnityEngine", "MonoBehaviour");              // the game's own scripts
+        if (topGo && comp.IsValid() && HaveChildren()) {
+            auto *ca = (uint8_t *)Children(topGo, (Il2CppObject *)comp.GetMonoType(), true);
             size_t n = ca ? *(uintptr_t *)(ca + 0x18) : 0;
             std::vector<std::pair<std::string, int>> parts;
             for (size_t i = 0; i < n && i < 3000; i++) {
@@ -2801,7 +2819,8 @@ static void ScanBlocks() {
             }
             Add("P: your Yeep has " + std::to_string(parts.size()) + " kinds of parts");
             for (size_t i = 0; i < parts.size() && i < 40; i++) Add("P: " + parts[i].first + " x" + std::to_string(parts[i].second));
-        } else Add("P: couldn't list the parts");
+        } else Add(std::string("P: couldn't list the parts (") + (topGo ? "" : "no object ") + (comp.IsValid() ? "" : "no type ") +
+                   (HaveChildren() ? "" : "no search") + ")");
     } catch (...) { Add("P: reading your Yeep failed"); }
     Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
     if (net.IsValid()) Collections("N: ", net.GetClass());
@@ -3273,11 +3292,11 @@ static void PillowHouse() {
     // Pillow spacing: the size of the pillow you're holding (its smallest side as it looks now),
     // or 82 cm if it can't be measured.
     float gap = 0.82f;
-    if (Alive(g_handItemObj) && G.getComponentsInChildren.IsValid() && G.tRenderer) {
+    if (Alive(g_handItemObj) && HaveChildren() && G.tRenderer) {
         struct Bnds { Vector3 c, e; };
         static Method<Bnds> getBounds = Class("UnityEngine", "Renderer").GetMethod("get_bounds", 0);
         Il2CppObject *go = G.compGameObject[g_handItemObj]();
-        auto *ra = go ? (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tRenderer, false) : nullptr;
+        auto *ra = go ? (uint8_t *)Children(go, (Il2CppObject *)G.tRenderer, false) : nullptr;
         size_t rn = ra ? *(uintptr_t *)(ra + 0x18) : 0;
         float best = 0;
         for (size_t i = 0; i < rn && i < 8 && getBounds.IsValid(); i++) {
@@ -4132,8 +4151,8 @@ static struct SpeakerWatch { Ref src, go; float loudRun = 0, quietRun = 0, volBe
 // through more than one, and keeps setting their volume, so the mute switch is used).
 static void SetVoiceMute(Il2CppObject *go, Il2CppObject *src, bool on) {
     if (Alive(src)) G.asSetMute[src](on);
-    if (!go || !G.getComponentsInChildren.IsValid()) return;
-    auto *ca = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tAudioSource, true);
+    if (!go || !HaveChildren()) return;
+    auto *ca = (uint8_t *)Children(go, (Il2CppObject *)G.tAudioSource, true);
     size_t n = ca ? *(uintptr_t *)(ca + 0x18) : 0;
     for (size_t i = 0; i < n && i < 8; i++) {
         Il2CppObject *a = ((Il2CppObject **)(ca + 0x20))[i];
@@ -4172,8 +4191,8 @@ static void FindSpeakers() {
         Il2CppObject *sp = ((Il2CppObject **)(arr + 0x20))[i];
         Il2CppObject *go = Alive(sp) ? G.compGameObject[sp]() : nullptr;
         Il2CppObject *src = go ? G.goGetComponent[go](G.tAudioSource) : nullptr;
-        if (!Alive(src) && go && G.getComponentsInChildren.IsValid()) {       // on a child object
-            auto *ca = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tAudioSource, true);
+        if (!Alive(src) && go && HaveChildren()) {       // on a child object
+            auto *ca = (uint8_t *)Children(go, (Il2CppObject *)G.tAudioSource, true);
             if (ca && *(uintptr_t *)(ca + 0x18) > 0) src = ((Il2CppObject **)(ca + 0x20))[0];
         }
         if (!Alive(src) && go && G.trGetParent.IsValid()) {                   // or on the parent
@@ -5192,10 +5211,8 @@ static bool g_laValid = false;
 static Vector3 LongReach(Vector3 chest, Vector3 hand, float k) {
     Vector3 d = hand - chest;
     float dist = sqrtf(Dot(d, d));
-    float t = (dist - 0.35f) / 0.20f;
-    t = t < 0 ? 0 : t > 1 ? 1 : t;
-    float kk = 1.0f + (k - 1.0f) * t;
-    return chest + d * kk;
+    (void)dist;
+    return chest + d * k;                                // the whole arm stretches, always
 }
 static void LongArmsFail(const char *why) {
     g_laState = 3;
@@ -5668,7 +5685,6 @@ static void OverpoweredTick(const Buttons &in, float dt) {
     BounceTick();
     ItemGunTick(in, dt);
     LongArmsTick();
-    try { LongArmsGrabTick(in); } catch (...) {}
 }
 static void OverpoweredReset() {                               // room change: the old objects are gone
     g_laTrackersSet = false;
