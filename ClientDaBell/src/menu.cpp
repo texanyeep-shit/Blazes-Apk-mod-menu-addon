@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v.1.2.8"
+#define CDB_VERSION "v.1.2.9"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -473,7 +473,7 @@ static bool g_barkOpen = false;                 // Bark Mode: the panel is open 
 static bool f_longArms, f_superSpeed, f_megaJump, f_superFly, f_rocket, f_grapple, f_groundPound, f_flingGun, f_propGun, f_bounce;   // Overpowered
 static char g_soundLabel[64] = "Play: (open to scan)";   // text of the soundboard play button
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
-struct PendingItem { Vector3 pos, vel; bool drop = false, orbit = false; };   // once it appears: drop it (Item Rain) / add it to Item Orbit
+struct PendingItem { Vector3 pos, vel; bool drop = false, orbit = false; Quaternion rot = Quaternion(0, 0, 0, 1); };   // once it appears: drop it (Item Rain) / add it to Item Orbit
 static std::vector<PendingItem> g_itemQueue;
 static double g_nextItem = 0, g_nextBatch = 0;
 static int g_dupeArmed = 0;
@@ -508,6 +508,7 @@ static void ArmDupe27();
 static void ArmDupe9x3();
 static void ItemRain();
 static void ItemCircle();
+static void PillowHouse();
 static void ItemOrbitToggled();
 static bool LeftHandItem();
 static void ScanSongs();
@@ -612,6 +613,7 @@ static Item g_items[] = {
     {ITEMS, "Spawn On Hand", TOGGLE, MAIN, &f_spawnOnHand},
     {ITEMS, "Item Rain", ACTION, MAIN, nullptr, ItemRain},
     {ITEMS, "Item Circle", ACTION, MAIN, nullptr, ItemCircle},
+    {ITEMS, "Pillow House", ACTION, MAIN, nullptr, PillowHouse},
     {ITEMS, "Item Orbit", TOGGLE, MAIN, &f_itemOrbit, ItemOrbitToggled},
 
     {SOUNDBOARD, "Exit Soundboard", OPEN, MAIN},
@@ -738,6 +740,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
     {"Game Finder", "Shows how the game stores items and blocks (for the full item list). Send a video of all its pages."},
     {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
+    {"Pillow House", "Builds a big house out of pillows 3.5 m in front of you (71 pillows, a few seconds). Everyone sees it."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
@@ -770,7 +773,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Thunderstorm", "Rain with lightning and thunder."},
     {"Effect Intensity", "Light, medium or heavy."},
     {"Overpowered", "The overpowered mods. Two pages."},
-    {"Long Arms", "Your arms reach farther. Hands go normal while the menu is open."},
+    {"Long Arms", "Your arms reach farther, and you can grab items with the long hands. Hands go normal while the menu is open."},
     {"Arm Length", "How long the arms are: 1.5x, 2x, 3x or 4x."},
     {"Super Speed", "A lot faster and higher jumps than Speed Boost."},
     {"Mega Jump", "Press B for a huge jump, even in the air. (Y with the right hand menu.)"},
@@ -2102,7 +2105,7 @@ static void ItemQueueTick() {
         PendingItem p = g_itemQueue.front();
         g_itemQueue.erase(g_itemQueue.begin());
         char id[8] = {};
-        bool ok = SendItem(g_itemKey, p.pos, Quaternion(0, 0, 0, 1), p.vel, id);
+        bool ok = SendItem(g_itemKey, p.pos, p.rot, p.vel, id);
         if (ok && (p.drop || p.orbit)) DropWatchAdd(id, p.orbit, p.pos);
         static int logged = 0;
         if (logged++ < 3) ym::log("clientdabell: spawn %s ok=%d", g_itemKey, ok ? 1 : 0);
@@ -2834,6 +2837,78 @@ static void ScanCatalog() {
 }
 // Tapping an item in the list: one of it appears 80 cm in front of you. Same limits as
 // Spawn On Hand: one every 0.3 s, through the item queue (2 sent per frame, 32 waiting at most).
+// Pillow House: a big house of pillows in front of you, 5 x 5 pillows across: walls 3 high with a
+// doorway facing you and a flat roof (71 pillows). Spawned items float where they appear, so the
+// house stays standing. The pillow is the game's own pillow item (the first item name with
+// "pillow" in it, from the Item Spawner list), or the item in your left hand.
+static std::string FindPillowKey() {
+    std::string best;
+    for (auto &k : g_seenKeys) {
+        std::string low = k;
+        for (auto &c : low) c = (char)tolower((unsigned char)c);
+        if (low.find("pillow") != std::string::npos && (best.empty() || k.size() < best.size())) best = k;
+    }
+    return best;
+}
+// The house is built in batches (27 at most per batch, AGENTS.md), one every 3 seconds (the
+// normal cooldown), so a bigger house just takes a few seconds to go up.
+static std::vector<PendingItem> g_houseLeft;
+static char g_houseKey[64] = "";
+static int g_houseBatch = 0, g_houseBatches = 0;
+static void PillowHouseTick() {
+    if (g_houseLeft.empty() || g_time < g_nextBatch || !g_itemQueue.empty()) return;
+    snprintf(g_itemKey, sizeof g_itemKey, "%s", g_houseKey);   // keep building with the pillow
+    size_t n = std::min<size_t>(25, g_houseLeft.size());
+    std::vector<PendingItem> batch(g_houseLeft.begin(), g_houseLeft.begin() + n);
+    g_houseLeft.erase(g_houseLeft.begin(), g_houseLeft.begin() + n);
+    QueueItems(batch);
+    g_houseBatch++;
+    if (g_houseLeft.empty()) Notify("Pillow house done!");
+    else Notify("Building pillow house %d/%d", g_houseBatch, g_houseBatches);
+}
+static void PillowHouse() {
+    Il2CppObject *head = g_head.get();
+    if (!head) return;
+    if (!g_houseLeft.empty()) { Notify("Still building the last one"); return; }
+    std::string key = FindPillowKey();
+    if (key.empty()) {
+        try { LoadItemCache(); } catch (...) {}          // the saved item list may have one
+        key = FindPillowKey();
+    }
+    if (key.empty()) {
+        if (!LeftHandItem()) { Notify("Hold a pillow in your left hand (or open Item Spawner once), then try again"); return; }
+        key = g_itemKey;
+    }
+    snprintf(g_houseKey, sizeof g_houseKey, "%s", key.c_str());
+    // 5 x 5 pillows across, walls 3 high with a doorway (1 wide, 2 high) facing you, a 5 x 5 roof.
+    const float gap = 0.5f;                              // pillow spacing
+    const int half = 2, wallH = 3;
+    Vector3 f = Flat(G.trGetForward[head]()), r = Cross(Vector3(0, 1, 0), f);
+    Vector3 hp = G.trGetPosition[head]();
+    Vector3 center = hp + f * 3.5f + Vector3(0, -1.2f, 0);   // floor level-ish, 3.5 m out
+    Quaternion faceYou = Quaternion::LookRotation(f), side = Quaternion::LookRotation(r);
+    std::vector<PendingItem> list;
+    auto Add = [&](int x, int y, int z, Quaternion q) {
+        PendingItem p{center + r * (x * gap) + f * (z * gap) + Vector3(0, y * gap, 0), Vector3(0, 0, 0)};
+        p.rot = q;
+        list.push_back(p);
+    };
+    for (int y = 0; y < wallH; y++)                      // walls, bottom row first
+        for (int z = -half; z <= half; z++)
+            for (int x = -half; x <= half; x++) {
+                bool edge = abs(x) == half || abs(z) == half;
+                if (!edge) continue;
+                if (x == 0 && z == -half && y < 2) continue;   // the doorway, on your side
+                Add(x, y, z, abs(x) == half ? side : faceYou);
+            }
+    for (int z = -half; z <= half; z++)                  // roof
+        for (int x = -half; x <= half; x++) Add(x, wallH, z, faceYou);
+    g_houseLeft = list;
+    g_houseBatch = 0;
+    g_houseBatches = (int)((list.size() + 24) / 25);
+    if (g_time < g_nextBatch) Notify("Pillow house starts in a moment");
+    PillowHouseTick();
+}
 static char g_checkKey[64] = "";
 static int g_checkBefore = -1;
 static double g_checkAt = 0;
@@ -3609,8 +3684,13 @@ static void ApplyLoop() {
 // still be measured). When it's quiet for kQuietSecs (the music stopped), their volume goes
 // back. Only your own game changes; nothing is sent.
 static constexpr int kMaxSpeakers = 16;
-static constexpr float kSongSecs = 5.0f, kQuietSecs = 1.0f, kPauseSecs = 0.3f, kLoud = 0.015f, kMutedVol = 0.02f;
-static struct SpeakerWatch { Ref src, go; float loudRun = 0, quietRun = 0, volBefore = 1; bool muted = false, byMute = false, muteBefore = false; } g_spk[kMaxSpeakers];
+// kSongSecs: nonstop sound before it counts as a song. kQuietSecs: silence before unmuting (long
+// enough that a quiet bit or a break in the song doesn't let it back in). kRemuteSecs: someone who
+// played a song in the last kSongMemory seconds is muted again after just this much sound, so a
+// song that starts again (or comes back after a break) isn't heard for long.
+static constexpr float kSongSecs = 3.0f, kQuietSecs = 3.0f, kPauseSecs = 0.4f, kLoud = 0.015f, kMutedVol = 0.02f;
+static constexpr float kRemuteSecs = 0.3f, kSongMemory = 90.0f;
+static struct SpeakerWatch { Ref src, go; float loudRun = 0, quietRun = 0, volBefore = 1; bool muted = false, byMute = false, muteBefore = false; double songEnded = -1000; } g_spk[kMaxSpeakers];
 // Mute or unmute every sound player on that player's voice object (the game can play a voice
 // through more than one, and keeps setting their volume, so the mute switch is used).
 static void SetVoiceMute(Il2CppObject *go, Il2CppObject *src, bool on) {
@@ -3633,6 +3713,7 @@ static void SpeakerUnmute(SpeakerWatch &w) {
     Il2CppObject *src = w.src.get();
     if (w.muted && w.byMute) SetVoiceMute(w.go.get(), src, w.muteBefore);   // back to how it was (you may have muted them yourself)
     else if (w.muted && Alive(src) && G.asSetVolume.IsValid()) G.asSetVolume[src](w.volBefore);
+    if (w.muted) w.songEnded = g_time;
     w.muted = false;
 }
 static void DisableSongsReset() {                       // everyone back to normal
@@ -3694,7 +3775,7 @@ static void DisableSongsTick() {
     }
     if (g_time >= g_nextSpkFind) { g_nextSpkFind = g_time + 2.0; FindSpeakers(); }
     if (g_time < g_nextSpkMeasure) return;
-    const float step = 0.1f;
+    const float step = 0.05f;                           // 20 times a second, so a song is caught quicker
     g_nextSpkMeasure = g_time + step;
     if (!g_spkBuf.get()) g_spkBuf.set((Il2CppObject *)G.arrayNew(G.floatClass, 1024));
     Il2CppObject *buf = g_spkBuf.get();
@@ -3737,7 +3818,8 @@ static void DisableSongsTick() {
             w.quietRun += step;
             if (w.quietRun >= kPauseSecs) w.loudRun = 0;   // a pause: that's talking, not a song
         }
-        if (!w.muted && w.loudRun >= kSongSecs) {
+        bool recent = g_time - w.songEnded < kSongMemory;   // played a song not long ago: catch it again right away
+        if (!w.muted && w.loudRun >= (recent ? kRemuteSecs : kSongSecs)) {
             // The mute switch when we can still measure from the clip (it isn't affected by
             // muting); else turn the volume down so it can still be measured.
             w.byMute = fromClip && G.asSetMute.IsValid();
@@ -3750,7 +3832,7 @@ static void DisableSongsTick() {
                 G.asSetVolume[src](kMutedVol);
             }
             w.muted = true;
-            Notify("Muted a song");
+            if (!recent) Notify("Muted a song");
             ym::log("clientdabell: disable songs: muted speaker %d (level %.3f)", k, level);
         } else if (w.muted) {
             if (w.byMute) SetVoiceMute(w.go.get(), src, true);   // keep it muted if the game turns it back on
@@ -4665,6 +4747,9 @@ static void SetTrackersToUpdate() {
     ym::log("clientdabell: long arms stretch: %d trackers found, %d set to Update", found, changed);
 }
 static bool g_laStretch = false;               // fallback: stretch the hand from where the trackers just put it
+// Where each hand really is (your controller) and where Long Arms put it, this frame. 0 left, 1 right.
+static Vector3 g_laReal[2], g_laReach[2];
+static bool g_laValid = false;
 static void LongArmsFail(const char *why) {
     g_laState = 3;
     if (g_laOwns && !g_dancing) PauseTrackers(false);
@@ -4677,6 +4762,7 @@ static void LongArmsFail(const char *why) {
 static void LongArmsTick() {
     Il2CppObject *head = g_head.get(), *lh = g_leftHand.get(), *rh = g_rightHand.get();
     bool want = f_longArms && !g_menuShown && !g_dancing && head && lh && rh;
+    g_laValid = false;
     if (!want) {
         if (g_laOwns && !g_dancing) { PauseTrackers(false); g_laOwns = false; }   // the menu and the dances need normal hands
         if (!f_longArms) g_laState = 0;
@@ -4693,9 +4779,14 @@ static void LongArmsTick() {
         Vector3 chest = G.trGetPosition[head]() + Vector3(0, -0.25f, 0);
         float k = kArmScales[g_armScale];
         static int logged = 0;
+        int side = 0;
         for (Il2CppObject *h : {lh, rh}) {
             Vector3 before = G.trGetPosition[h]();
             G.trSetPosition[h](chest + (before - chest) * k);
+            g_laReal[side] = before;
+            g_laReach[side] = chest + (before - chest) * k;
+            side++;
+            g_laValid = true;
             if (logged < 4) { Vector3 after = G.trGetPosition[h](); ym::log("clientdabell: stretch hand %.2f,%.2f,%.2f -> %.2f,%.2f,%.2f", before.x, before.y, before.z, after.x, after.y, after.z); logged++; }
         }
         return;
@@ -4719,6 +4810,56 @@ static void LongArmsTick() {
     G.trSetRotation[lh](ql);
     G.trSetPosition[rh](chest + (pr - chest) * k);
     G.trSetRotation[rh](qr);
+    g_laReal[0] = pl; g_laReal[1] = pr;
+    g_laReach[0] = chest + (pl - chest) * k; g_laReach[1] = chest + (pr - chest) * k;
+    g_laValid = true;
+}
+// Grabbing with Long Arms: the game grabs with where your controller really is, not the long
+// hand. So when you squeeze a grip with a long hand on an item, the item is brought to your real
+// hand and held there for a moment while you keep squeezing, and the game's normal grab picks it
+// up. Only the item's spot on your own screen is moved; the room sees it once it's in your hand.
+static Ref g_laPull[2];
+static double g_laPullUntil[2] = {0, 0};
+static bool g_laGripPrev[2] = {false, false};
+static Il2CppObject *NearestItem(Vector3 at, float range) {
+    if (!G.tItem || !(G.findScene.IsValid() || G.findSceneByType.IsValid())) return nullptr;
+    uint8_t *arr = nullptr;
+    try {
+        arr = (uint8_t *)(G.findScene.IsValid() ? G.findScene((Il2CppObject *)G.tItem) : G.findSceneByType((Il2CppObject *)G.tItem, 0));
+    } catch (...) { return nullptr; }
+    size_t n = arr ? *(uintptr_t *)(arr + 0x18) : 0;
+    Il2CppObject *best = nullptr;
+    float bestD = range * range;
+    for (size_t i = 0; i < n && i < 5000; i++) {
+        Il2CppObject *o = ((Il2CppObject **)(arr + 0x20))[i];
+        if (!Alive(o)) continue;
+        Il2CppObject *t = G.compTransform[o]();
+        if (!t) continue;
+        Vector3 d = G.trGetPosition[t]() - at;
+        float dd = Dot(d, d);
+        if (dd < bestD) { bestD = dd; best = o; }
+    }
+    return best;
+}
+static void LongArmsGrabTick(const Buttons &in) {
+    for (int i = 0; i < 2; i++) {
+        bool grip = i ? in.rgrip : in.lgrip, press = grip && !g_laGripPrev[i];
+        g_laGripPrev[i] = grip;
+        if (!grip || !g_laValid) { g_laPull[i].clear(); g_laPullUntil[i] = 0; continue; }
+        if (press) {
+            Vector3 gap = g_laReach[i] - g_laReal[i];
+            Il2CppObject *item = Dot(gap, gap) > 0.15f * 0.15f ? NearestItem(g_laReach[i], 0.35f) : nullptr;
+            if (item) { g_laPull[i].set(item); g_laPullUntil[i] = g_time + 0.5; }
+        }
+        Il2CppObject *item = g_laPull[i].get();
+        if (!Alive(item) || g_time > g_laPullUntil[i]) { g_laPull[i].clear(); continue; }
+        try {
+            if (Il2CppObject *t = G.compTransform[item]()) G.trSetPosition[t](g_laReal[i]);
+            Il2CppObject *go = G.compGameObject[item]();
+            Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go]((Il2CppObject *)G.tRigidbody) : nullptr;
+            if (rb && G.rbSetVelocity.IsValid()) G.rbSetVelocity[rb](Vector3(0, 0, 0));
+        } catch (...) { g_laPull[i].clear(); }
+    }
 }
 
 // Mega Jump: press B (Y if the menu is on your right hand) for a jump of any power, in the air too.
@@ -4976,6 +5117,7 @@ static void OverpoweredTick(const Buttons &in, float dt) {
     BounceTick();
     ItemGunTick(in, dt);
     LongArmsTick();
+    try { LongArmsGrabTick(in); } catch (...) {}
 }
 static void OverpoweredReset() {                               // room change: the old objects are gone
     g_laTrackersSet = false;
@@ -5140,7 +5282,7 @@ static void OnUpdate(float dt) {
     TeleportGunTick(in);
     try { ItemOrbitTick(dt); }
     catch (...) { f_itemOrbit = false; try { OrbitRelease(); } catch (...) {} ym::log("clientdabell: item orbit error, turned off"); }
-    try { SpawnOnHandTick(in); ItemQueueTick(); SpawnCheckTick(); }
+    try { SpawnOnHandTick(in); ItemQueueTick(); SpawnCheckTick(); PillowHouseTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("clientdabell: item code error"); }
     try { DisableSongsTick(); }
     catch (...) { f_disableSongs = false; try { DisableSongsReset(); } catch (...) {} ym::log("clientdabell: disable songs error, turned off"); }
