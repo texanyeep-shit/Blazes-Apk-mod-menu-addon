@@ -25,7 +25,7 @@ using namespace BNM::Structures::Unity;
 using BNM::IL2CPP::Il2CppObject;
 
 YEEPS_MOD("ClientDaBell")
-#define CDB_VERSION "v.1.2.8"
+#define CDB_VERSION "v.1.2.9"
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -740,7 +740,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Item Orbit", "Hold an item in your left hand, then turn this on: it and 31 copies circle around you until you turn it off."},
     {"Game Finder", "Shows how the game stores items and blocks (for the full item list). Send a video of all its pages."},
     {"Item Spawner", "Every item in the game, as a list: tap one to spawn it in front of you."},
-    {"Pillow House", "Builds a big house out of pillows 3.5 m in front of you (71 pillows, a few seconds). Everyone sees it."},
+    {"Pillow House", "Builds a big house out of pillows in front of you (71 pillows, a few seconds). Everyone sees it."},
     {"Item Circle", "32 of the item in your left hand appear in a circle around you. Everyone sees them."},
     {"Item Rain", "32 of the item in your left hand fall from the sky around you. Everyone sees them."},
     {"Wave", "Waves one hand, the other on your hip. Hold left trigger."},
@@ -2841,12 +2841,21 @@ static void ScanCatalog() {
 // doorway facing you and a flat roof (71 pillows). Spawned items float where they appear, so the
 // house stays standing. The pillow is the game's own pillow item (the first item name with
 // "pillow" in it, from the Item Spawner list), or the item in your left hand.
+// One single pillow: names with "pillow" in them, but not piles, stacks, forts, packs or spawners
+// (those make a whole bunch of pillows each).
+static bool IsGroupName(const std::string &low) {
+    for (const char *w : {"pile", "stack", "fort", "pack", "bundle", "spawn", "box", "bag", "dispens", "crate", "set", "group",
+                          "multi", "many", "heap", "chest", "machine", "station", "rack", "shelf"})
+        if (low.find(w) != std::string::npos) return true;
+    return false;
+}
 static std::string FindPillowKey() {
     std::string best;
     for (auto &k : g_seenKeys) {
         std::string low = k;
         for (auto &c : low) c = (char)tolower((unsigned char)c);
-        if (low.find("pillow") != std::string::npos && (best.empty() || k.size() < best.size())) best = k;
+        if (low.find("pillow") == std::string::npos || IsGroupName(low)) continue;
+        if (best.empty() || k.size() < best.size()) best = k;
     }
     return best;
 }
@@ -2870,22 +2879,22 @@ static void PillowHouse() {
     Il2CppObject *head = g_head.get();
     if (!head) return;
     if (!g_houseLeft.empty()) { Notify("Still building the last one"); return; }
-    std::string key = FindPillowKey();
+    // A pillow in your left hand comes first (that's surely one single pillow), then the item list.
+    std::string key;
+    if (LeftHandItem()) key = g_itemKey;
     if (key.empty()) {
-        try { LoadItemCache(); } catch (...) {}          // the saved item list may have one
         key = FindPillowKey();
+        if (key.empty()) { try { LoadItemCache(); } catch (...) {} key = FindPillowKey(); }
     }
-    if (key.empty()) {
-        if (!LeftHandItem()) { Notify("Hold a pillow in your left hand (or open Item Spawner once), then try again"); return; }
-        key = g_itemKey;
-    }
+    if (key.empty()) { Notify("Hold one pillow in your left hand, then try again"); return; }
     snprintf(g_houseKey, sizeof g_houseKey, "%s", key.c_str());
+    ym::log("clientdabell: pillow house uses %s", g_houseKey);
     // 5 x 5 pillows across, walls 3 high with a doorway (1 wide, 2 high) facing you, a 5 x 5 roof.
-    const float gap = 0.5f;                              // pillow spacing
+    const float gap = 0.82f;                             // pillow spacing (Yeeps pillows are about 80 cm)
     const int half = 2, wallH = 3;
     Vector3 f = Flat(G.trGetForward[head]()), r = Cross(Vector3(0, 1, 0), f);
     Vector3 hp = G.trGetPosition[head]();
-    Vector3 center = hp + f * 3.5f + Vector3(0, -1.2f, 0);   // floor level-ish, 3.5 m out
+    Vector3 center = hp + f * 5.0f + Vector3(0, -1.0f, 0);   // near the floor, 5 m out (the front wall is about 3.4 m away)
     Quaternion faceYou = Quaternion::LookRotation(f), side = Quaternion::LookRotation(r);
     std::vector<PendingItem> list;
     auto Add = [&](int x, int y, int z, Quaternion q) {
@@ -2906,7 +2915,7 @@ static void PillowHouse() {
     g_houseLeft = list;
     g_houseBatch = 0;
     g_houseBatches = (int)((list.size() + 24) / 25);
-    if (g_time < g_nextBatch) Notify("Pillow house starts in a moment");
+    Notify("Building with %.40s", g_houseKey);
     PillowHouseTick();
 }
 static char g_checkKey[64] = "";
