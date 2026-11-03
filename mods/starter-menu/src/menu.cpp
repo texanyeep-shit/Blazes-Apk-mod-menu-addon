@@ -785,7 +785,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Thunderstorm", "Rain with lightning and thunder."},
     {"Effect Intensity", "Light, medium or heavy."},
     {"Overpowered", "The overpowered mods. Two pages."},
-    {"Long Arms", "Reach out and your arms get long (grab items with them). Close to your body they stay normal for the bubbles."},
+    {"Long Arms", "Your arms reach farther. Hands go normal while the menu is open."},
     {"Arm Length", "How long the arms are: 1.5x, 2x, 3x or 4x."},
     {"Super Speed", "A lot faster and higher jumps than Speed Boost."},
     {"Mega Jump", "Press B for a huge jump, even in the air. (Y with the right hand menu.)"},
@@ -2782,7 +2782,7 @@ static void ScanBlocks() {
             top = pt;
         }
         Il2CppObject *topGo = top ? G.compGameObject[top]() : go;
-        Class comp("UnityEngine", "Component");
+        Class comp("UnityEngine", "MonoBehaviour");              // the game's own scripts
         if (topGo && comp.IsValid() && G.getComponentsInChildren.IsValid()) {
             auto *ca = (uint8_t *)G.getComponentsInChildren[topGo]((Il2CppObject *)comp.GetMonoType(), true);
             size_t n = ca ? *(uintptr_t *)(ca + 0x18) : 0;
@@ -2801,7 +2801,8 @@ static void ScanBlocks() {
             }
             Add("P: your Yeep has " + std::to_string(parts.size()) + " kinds of parts");
             for (size_t i = 0; i < parts.size() && i < 40; i++) Add("P: " + parts[i].first + " x" + std::to_string(parts[i].second));
-        } else Add("P: couldn't list the parts");
+        } else Add(std::string("P: couldn't list the parts (") + (topGo ? "" : "no object ") + (comp.IsValid() ? "" : "no type ") +
+                   (G.getComponentsInChildren.IsValid() ? "" : "no search") + ")");
     } catch (...) { Add("P: reading your Yeep failed"); }
     Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
     if (net.IsValid()) Collections("N: ", net.GetClass());
@@ -5192,10 +5193,8 @@ static bool g_laValid = false;
 static Vector3 LongReach(Vector3 chest, Vector3 hand, float k) {
     Vector3 d = hand - chest;
     float dist = sqrtf(Dot(d, d));
-    float t = (dist - 0.35f) / 0.20f;
-    t = t < 0 ? 0 : t > 1 ? 1 : t;
-    float kk = 1.0f + (k - 1.0f) * t;
-    return chest + d * kk;
+    (void)dist;
+    return chest + d * k;                                // the whole arm stretches, always
 }
 static void LongArmsFail(const char *why) {
     g_laState = 3;
@@ -5668,7 +5667,6 @@ static void OverpoweredTick(const Buttons &in, float dt) {
     BounceTick();
     ItemGunTick(in, dt);
     LongArmsTick();
-    try { LongArmsGrabTick(in); } catch (...) {}
 }
 static void OverpoweredReset() {                               // room change: the old objects are gone
     g_laTrackersSet = false;
