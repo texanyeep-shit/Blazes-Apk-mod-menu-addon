@@ -2088,6 +2088,53 @@ static void FreezeItem(Il2CppObject *it, Vector3 pos, Quaternion rot) {
     }
     if (Il2CppObject *t = G.compTransform[it]()) { G.trSetPosition[t](pos); G.trSetRotation[t](rot); }
 }
+// Placing a building block the way the game does when you let go of one next to a surface: the
+// block's own "deploy" step (found by name on the block, once), or else the game's normal drop.
+static const void *g_deployMethod = nullptr;
+static bool g_deployLooked = false;
+static std::string g_deployName = "drop";
+static const void *FindDeploy(Il2CppObject *it) {
+    if (g_deployLooked) return g_deployMethod;
+    g_deployLooked = true;
+    auto Rs = ym::api()->resolve;
+    auto getMethods = (const void *(*)(void *, void **))Rs("il2cpp_class_get_methods");
+    auto methodName = (const char *(*)(const void *))Rs("il2cpp_method_get_name");
+    auto paramCount = (uint32_t (*)(const void *))Rs("il2cpp_method_get_param_count");
+    auto getParent = (void *(*)(void *))Rs("il2cpp_class_get_parent");
+    if (!getMethods || !methodName || !paramCount || !getParent || !it) return nullptr;
+    static const char *kBest[] = {"TrySendDeploy", "SendDeploy", "TryDeploy", "Deploy", "TrySendPlace", "TryPlace", "Place"};
+    const void *found = nullptr;
+    int foundRank = 100;
+    std::string foundName;
+    for (void *c = it->klass; c; c = getParent(c)) {
+        void *iter = nullptr;
+        while (const void *m = getMethods(c, &iter)) {
+            const char *n = methodName(m);
+            if (!n || paramCount(m) != 0) continue;
+            int rank = 100;
+            for (int k = 0; k < 7; k++) if (!strcmp(n, kBest[k])) rank = k;
+            if (rank == 100 && strstr(n, "Deploy") && !strstr(n, "Preview") && strncmp(n, "Can", 3) && strncmp(n, "Is", 2) &&
+                strncmp(n, "get_", 4) && strncmp(n, "On", 2) && strncmp(n, "Get", 3))
+                rank = 50;
+            if (rank < foundRank) { foundRank = rank; found = m; foundName = n; }
+        }
+    }
+    g_deployMethod = found;
+    if (found) g_deployName = foundName;
+    ym::log("clientdabell: block place step: %s", found ? foundName.c_str() : "none (using drop)");
+    return found;
+}
+static void PlaceBlock(Il2CppObject *it) {
+    auto invoke = (void *(*)(const void *, void *, void **, void **))ym::api()->resolve("il2cpp_runtime_invoke");
+    const void *m = FindDeploy(it);
+    if (m && invoke) {
+        void *exc = nullptr;
+        invoke(m, it, nullptr, &exc);
+        if (!exc) return;
+        ym::log("clientdabell: %s said no, dropping instead", g_deployName.c_str());
+    }
+    try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}
+}
 static void DropItem(Il2CppObject *it) {
     try { if (G.itemDrop.IsValid()) G.itemDrop[it](); } catch (...) {}
     Il2CppObject *go = G.compGameObject[it]();
@@ -2136,7 +2183,10 @@ static void DropWatchTick() {
             }
             if (!match) continue;
             if (g_dropWatch[k].orbit) OrbitAdd(it);
-            else if (g_dropWatch[k].freeze) FreezeItem(it, g_dropWatch[k].pos, g_dropWatch[k].rot);
+            else if (g_dropWatch[k].freeze) {
+                FreezeItem(it, g_dropWatch[k].pos, g_dropWatch[k].rot);
+                if (!strcmp(g_itemKey, "mapObject")) { try { PlaceBlock(it); } catch (...) {} }   // a building block: place it
+            }
             else DropItem(it);
             g_dropWatch.erase(g_dropWatch.begin() + k);
             break;
@@ -3074,7 +3124,7 @@ static void PillowHouseTick() {
         int now = CountInRoom(g_houseKey);
         if (now >= 0 && g_houseBefore >= 0) {
             int got = now - g_houseBefore;
-            Notify("Pillow house: %d of %d showed up", got < 0 ? 0 : got, g_houseTotal);
+            Notify("Pillow house: %d of %d showed up (placed with %.20s)", got < 0 ? 0 : got, g_houseTotal, g_deployName.c_str());
             ym::log("clientdabell: pillow house %s: %d of %d showed up (before %d, after %d)", g_houseKey, got, g_houseTotal, g_houseBefore, now);
         }
     }
@@ -3097,6 +3147,7 @@ static void PillowHouse() {
     std::string key;
     // Whatever you're holding is used as it is (the game's name for the 1x1 pillow may not even
     // say "pillow"), unless it's a bomb or something else that blows up into a bunch of things.
+    g_handItemObj = nullptr;
     if (HeldItemKey(g_leftHand.get()) || HeldItemKey(g_rightHand.get())) {   // either hand works
         std::string low = g_itemKey;
         for (auto &c : low) c = (char)tolower((unsigned char)c);
@@ -3114,11 +3165,35 @@ static void PillowHouse() {
     snprintf(g_houseKey, sizeof g_houseKey, "%s", key.c_str());
     ym::log("clientdabell: pillow house uses %s", g_houseKey);
     // 5 x 5 pillows across, walls 3 high with a doorway (1 wide, 2 high) facing you, a 5 x 5 roof.
-    const float gap = 0.82f;                             // pillow spacing (Yeeps pillows are about 80 cm)
+    // Pillow spacing: the size of the pillow you're holding (its smallest side as it looks now),
+    // or 82 cm if it can't be measured.
+    float gap = 0.82f;
+    if (Alive(g_handItemObj) && G.getComponentsInChildren.IsValid() && G.tRenderer) {
+        struct Bnds { Vector3 c, e; };
+        static Method<Bnds> getBounds = Class("UnityEngine", "Renderer").GetMethod("get_bounds", 0);
+        Il2CppObject *go = G.compGameObject[g_handItemObj]();
+        auto *ra = go ? (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)G.tRenderer, false) : nullptr;
+        size_t rn = ra ? *(uintptr_t *)(ra + 0x18) : 0;
+        float best = 0;
+        for (size_t i = 0; i < rn && i < 8 && getBounds.IsValid(); i++) {
+            Il2CppObject *rr = ((Il2CppObject **)(ra + 0x20))[i];
+            if (!Alive(rr)) continue;
+            Bnds b = getBounds[rr]();
+            float side = 2 * fminf(b.e.x, fminf(b.e.y, b.e.z));
+            if (side > best) best = side;
+        }
+        if (best > 0.15f && best < 2.0f) gap = best;
+        ym::log("clientdabell: pillow house: pillow measures %.2f m, spacing %.2f", best, gap);
+    }
     const int half = 2, wallH = 3;
     Vector3 f = Flat(G.trGetForward[head]()), r = Cross(Vector3(0, 1, 0), f);
     Vector3 hp = G.trGetPosition[head]();
-    Vector3 center = hp + f * 5.0f + Vector3(0, -1.0f, 0);   // near the floor, 5 m out (the front wall is about 3.4 m away)
+    Vector3 center = hp + f * (gap * 2 + 1.8f);          // the front wall about 1.8 m away
+    {                                                    // stand it on the floor: find the ground under the middle
+        BNM::Structures::Unity::RaycastHit hit{};
+        bool ground = G.raycast.IsValid() && G.raycast(center + Vector3(0, 1.0f, 0), Vector3(0, -1, 0), &hit, 6.0f, -5);
+        center.y = (ground ? hit.point.y : hp.y - 1.4f) + gap * 0.5f;
+    }
     Quaternion faceYou = Quaternion::LookRotation(f), side = Quaternion::LookRotation(r);
     std::vector<PendingItem> list;
     auto Add = [&](int x, int y, int z, Quaternion q) {
