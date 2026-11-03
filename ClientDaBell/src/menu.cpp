@@ -512,6 +512,7 @@ static void ItemCircle();
 static void PillowHouse();
 static void ItemOrbitToggled();
 static bool LeftHandItem();
+static bool HeldItemKey(Il2CppObject *hand);
 static void ScanSongs();
 static void PlaySong();
 static void NextSong();
@@ -2580,6 +2581,72 @@ static void ScanBlocks() {
             Add(std::string(prefix) + ((r.fieldFlags(f) & 0x10) ? "static " : "") + Name(r.fieldName(f), idx) + " : " + t);
         }
     };
+    // The item you're holding (either hand), first: every value stored on it and on each part of
+    // its object ("H:" lines), so we can see where a building block keeps which block it is.
+    g_handItemObj = nullptr;
+    if (HeldItemKey(g_leftHand.get()) || HeldItemKey(g_rightHand.get())) {
+        Il2CppObject *held = g_handItemObj;
+        Add(std::string("H: holding ") + g_itemKey);
+        void *strK = Class("System", "String").GetClass();
+        auto Values = [&](Il2CppObject *obj, const char *prefix) {
+            int idx = -1;
+            for (void *c = obj->klass; c; c = r.getParent(c)) {
+                const char *cn = r.className(c);
+                if (cn && (!strcmp(cn, "MonoBehaviour") || !strcmp(cn, "Behaviour") || !strcmp(cn, "Component") || !strcmp(cn, "Object"))) break;
+                void *iter = nullptr;
+                while (void *f = r.getFields(c, &iter)) {
+                    idx++;
+                    if (r.fieldFlags(f) & 0x10) continue;
+                    int kind = r.typeKind(r.fieldType(f));
+                    int off = (int)r.fieldOffset(f);
+                    if (off < (int)sizeof(Il2CppObject) || off > 0x4000) continue;
+                    uint8_t *at = (uint8_t *)obj + off;
+                    char val[64] = "";
+                    switch (kind) {
+                    case 0x02: snprintf(val, sizeof val, "%s", *at ? "true" : "false"); break;
+                    case 0x04: case 0x05: snprintf(val, sizeof val, "%d", (int)*(int8_t *)at); break;
+                    case 0x06: case 0x07: snprintf(val, sizeof val, "%d", (int)*(int16_t *)at); break;
+                    case 0x08: case 0x09: case 0x11: snprintf(val, sizeof val, "%d", *(int32_t *)at); break;   // numbers and enums
+                    case 0x0a: case 0x0b: snprintf(val, sizeof val, "%lld", (long long)*(int64_t *)at); break;
+                    case 0x0c: snprintf(val, sizeof val, "%.3f", *(float *)at); break;
+                    case 0x0e: {
+                        auto *o = *(Il2CppObject **)at;
+                        if (!o) snprintf(val, sizeof val, "null");
+                        else if (o->klass == strK) snprintf(val, sizeof val, "\"%.40s\"", ((BNM::Structures::Mono::String *)o)->str().c_str());
+                        break;
+                    }
+                    case 0x1d: { auto *a = *(uint8_t **)at; snprintf(val, sizeof val, "%d long", a ? (int)*(uintptr_t *)(a + 0x18) : -1); break; }
+                    default: { auto *o = *(Il2CppObject **)at; snprintf(val, sizeof val, "%s", (kind == 0x12 || kind == 0x15) ? (o ? "set" : "null") : "?"); }
+                    }
+                    char *tn = typeName(r.fieldType(f));
+                    std::string t = tn ? Short(tn) : "?";
+                    if (tn && freeMem) freeMem(tn);
+                    if (t.size() > 24) t = t.substr(0, 24);
+                    Add(std::string(prefix) + Name(r.fieldName(f), idx) + " " + t + " = " + val);
+                }
+            }
+        };
+        if (held) {
+            Values(held, "H: ");
+            Il2CppObject *go = G.compGameObject[held]();
+            Class comp("UnityEngine", "Component");
+            if (go && comp.IsValid() && G.getComponentsInChildren.IsValid()) {
+                auto *ca = (uint8_t *)G.getComponentsInChildren[go]((Il2CppObject *)comp.GetMonoType(), true);
+                size_t n = ca ? *(uintptr_t *)(ca + 0x18) : 0;
+                for (size_t i = 0; i < n && i < 24; i++) {
+                    Il2CppObject *cpt = ((Il2CppObject **)(ca + 0x20))[i];
+                    if (!Alive(cpt) || cpt == held) continue;
+                    const char *cn = r.className(cpt->klass);
+                    if (!cn) continue;
+                    std::string name = cn;
+                    if (name == "Transform" || name.find("Renderer") != std::string::npos || name.find("Collider") != std::string::npos ||
+                        name.find("MeshFilter") != std::string::npos || name == "Rigidbody" || name == "AudioSource") continue;
+                    Add("HC: " + name);
+                    Values(cpt, "   ");
+                }
+            }
+        }
+    }
     Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
     if (net.IsValid()) Collections("N: ", net.GetClass());
     void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
@@ -2955,6 +3022,7 @@ static bool HeldItemKey(Il2CppObject *hand) {
     snprintf(g_itemKey, sizeof g_itemKey, "%s", key->str().c_str());
     SeeKey(g_itemKey);
     try { CaptureSpawnData(best, g_itemKey); } catch (...) {}
+    g_handItemObj = best;
     return true;
 }
 static bool IsNotPlainPillow(const std::string &low) {
