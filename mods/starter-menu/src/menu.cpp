@@ -461,7 +461,8 @@ static Buttons ReadButtons() {
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
 static bool f_itemGun, f_stealGun, f_spawnOnHand, f_car, f_soundLoop, f_stickFly, f_dash, f_itemOrbit;
-static bool f_autoPlay = false;                  // Soundboard: when a song ends, play the next one
+static bool f_autoPlay = false;
+static bool f_bothPointers = false;               // Settings: a pointer on both index fingers                  // Soundboard: when a song ends, play the next one
 static bool f_soundMic = true;                  // soundboard goes out through your voice chat
 static bool f_overlap = false;                  // Play while a song plays mixes the two together
 static bool f_disableSongs = false;             // mute other players while they play music
@@ -514,6 +515,8 @@ static void ItemOrbitToggled();
 static bool LeftHandItem();
 static bool HeldItemKey(Il2CppObject *hand);
 static bool StealItemAt(Vector3 point, int side);
+static void DropStolenItem();
+static void StealGunToggled();
 static void ScanSongs();
 static void PlaySong();
 static void NextSong();
@@ -608,9 +611,10 @@ static Item g_items[] = {
 
     {ITEMS, "Exit Items", OPEN, MAIN},
     {ITEMS, "Item Spawner", OPEN, SPAWNER},
+    {ITEMS, "Spawn Eggs", OPEN, SPAWNER},
     {ITEMS, "Game Finder", OPEN, BLOCKS},
     {ITEMS, "Spawn Item Gun", TOGGLE, MAIN, &f_itemGun},
-    {ITEMS, "Item Stealer", TOGGLE, MAIN, &f_stealGun},
+    {ITEMS, "Item Stealer", TOGGLE, MAIN, &f_stealGun, StealGunToggled},
     {ITEMS, "Duplicate Items (3x3)", ACTION, MAIN, nullptr, ArmDupe9},
     {ITEMS, "Duplicate Items (3x3x3)", ACTION, MAIN, nullptr, ArmDupe27},
     {ITEMS, "Duplicate Items (9x3)", ACTION, MAIN, nullptr, ArmDupe9x3},
@@ -663,6 +667,7 @@ static Item g_items[] = {
     {SETTINGS, "Iron Man Speed", ACTION, MAIN, nullptr, NextIronSpeed},
     {SETTINGS, "Car Speed", ACTION, MAIN, nullptr, NextCarSpeed},
     {SETTINGS, "Right Hand Menu", TOGGLE, MAIN, &f_rightHand, PointerToHand},
+    {SETTINGS, "Pointer In Both Hands", TOGGLE, MAIN, &f_bothPointers, PointerToHand},
     {SETTINGS, "Bark Mode", TOGGLE, MAIN, &f_barkMode, BarkModeToggled},
     {SETTINGS, "Menu Size", ACTION, MAIN, nullptr, NextMenuSize},
     {SETTINGS, "Change Menu Theme", ACTION, MAIN, nullptr, NextTheme},
@@ -700,7 +705,7 @@ static std::vector<Item *> g_pausedMods;
 static Item g_disableAllItem = {ENABLED, "Disable All Mods", TOGGLE, MAIN, &f_modsPaused, DisableAllMods};
 // What the Enabled Mods page lists: switches that are on, except settings that aren't mods.
 static bool ListedAsMod(const Item &it) {
-    return it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_colorBlind && it.flag != &f_barkMode;
+    return it.kind == TOGGLE && *it.flag && it.flag != &f_notify && it.flag != &f_soundMic && it.flag != &f_colorBlind && it.flag != &f_barkMode && it.flag != &f_bothPointers;
 }
 
 // Tooltips, shown under the menu while your finger is on a button (like ii's).
@@ -731,12 +736,15 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Change Menu Theme", "Plush Blue, Orange, Blue, Green, Purple, Dark."},
     {"Rainbow Menu", "The menu cycles through colors."},
     {"Menu Size", "Slide the circle: left is 50%, right is 150%. Let go to resize."},
+    {"Pointer In Both Hands", "Both index fingers get a pointer, so either hand presses buttons (best with Bark Mode)."},
     {"Color Blind Mode", "Buttons that are on say [ON] and turn orange with dark text; pressed buttons flash white."},
     {"Show FPS", "Frames per second in the title."},
     {"Show Clock", "The time in the title."},
     {"Rig Mods", "Pick a dance, then hold left trigger. Everyone sees it."},
     {"Items", "Spawn copies of the item in your left hand. Everyone sees them."},
     {"Spawn Item Gun", "Hold an item in your left hand. Right grip aims, trigger spawns it."},
+    {"Spawn Eggs", "Every mob spawn egg in the game. Tap one to spawn it in front of you."},
+    {"Item Stealer", "Right grip aims; trigger grabs into your left hand. Trigger again drops it."},
     {"Duplicate Items (3x3)", "9 of the item in your left hand appear in front of you."},
     {"Duplicate Items (3x3x3)", "27 of the item in your left hand appear in front of you."},
     {"Duplicate Items (9x3)", "27 of the item in your left hand appear in a row of 9, three deep."},
@@ -856,6 +864,8 @@ static float RowY(int r) { return g_barkLayout ? 0.095f - (r / 2) * 0.072f : 0.1
 static float RowX(int r) { return g_barkLayout ? (r % 2 ? 1.0f : -1.0f) * 0.112f : 0.0f; }
 
 static Ref g_menu, g_board, g_bg, g_outline, g_pointer, g_title, g_titleBar;
+static Ref g_pointer2;                                  // Pointer In Both Hands: a second ball on the menu hand
+static int g_pressSide = 0;                             // which pointer is pressing: 0 the normal one, 1 the second
 static Ref g_rowCube[kRows], g_rowLabel[kRows], g_rowText[kRows];
 static Ref g_prev, g_next, g_notifyGo, g_notifyText, g_tipText, g_leftPlatform, g_rightPlatform;
 static double g_openTime = 0, g_flashUntil = 0;
@@ -984,6 +994,14 @@ static void PointerToHand() {
     if (f_rightHand) at.x = -at.x;
     G.trSetParent[t](hand, false);
     G.trSetLocalPosition[t](at);
+    Il2CppObject *p2 = g_pointer2.get(), *hand2 = f_rightHand ? g_rightHand.get() : g_leftHand.get();
+    if (Alive(p2) && hand2) {                            // the same spot on the other hand's finger (mirrored)
+        Vector3 at2 = at;
+        at2.x = -at2.x;
+        G.trSetParent[Tr(p2)](hand2, false);
+        G.trSetLocalPosition[Tr(p2)](at2);
+    }
+    Show(g_pointer2, g_menuShown && f_bothPointers);
 }
 static void NextPointer() { g_pointerSpot = (g_pointerSpot + 1) % 4; PointerToHand(); Notify("Pointer position %d", g_pointerSpot + 1); }
 
@@ -1107,8 +1125,12 @@ static void BuildMenu() {
     if (Il2CppObject *p = Prim(0, T().bgB, false)) {
         G.trSetLocalScale[Tr(p)](Vector3(0.01f, 0.01f, 0.01f));
         g_pointer.set(p);
-        PointerToHand();
     }
+    if (Il2CppObject *p2 = Prim(0, T().bgB, false)) {
+        G.trSetLocalScale[Tr(p2)](Vector3(0.01f, 0.01f, 0.01f));
+        g_pointer2.set(p2);
+    }
+    PointerToHand();
     // Notifications: a line of text low in your view, like ii's notifications
     if (Il2CppObject *n = Canvas(g_head.get(), Vector3(0, -0.12f, 0.6f), 0.5f, 0.05f)) {
         g_notifyGo.set(n);
@@ -1117,6 +1139,7 @@ static void BuildMenu() {
     }
     G.goSetActive[menu](false);
     Show(g_pointer, false);
+    Show(g_pointer2, false);
     g_built = true;
     g_dirty = true;
 }
@@ -1192,6 +1215,7 @@ static void RenderPage() {
     SetColor(g_outline.get(), T().title);
     SetColor(g_titleBar.get(), T().buttonOn);
     SetColor(g_pointer.get(), T().bgB);
+    SetColor(g_pointer2.get(), T().bgB);
     if (Alive(g_title.get())) G.graphicSetColor[g_title.get()](Color(1, 1, 1, 1));
     g_nextTitle = 0;                     // refresh the title now
     g_dirty = false;
@@ -1236,6 +1260,7 @@ static void ShowMenu(bool show) {
     if (show) { g_openTime = g_time; g_dirty = true; g_hover = -2; SetText(g_tipText, ""); g_barkPlaced = false; }
     Show(g_menu, show);
     Show(g_pointer, show);
+    Show(g_pointer2, show && f_bothPointers);
     g_touching = -2;
 }
 
@@ -1296,13 +1321,14 @@ static void RebuildMenuNow() {
     g_rebuiltNote = true;
     for (int r = 0; r < kRows; r++) { g_rowCube[r].clear(); g_rowLabel[r].clear(); g_rowText[r].clear(); }
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText, &g_homeCube, &g_homeLabel}) r->clear();
-    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo}) Kill(*r);
+    for (Ref *r : {&g_menu, &g_pointer, &g_pointer2, &g_notifyGo}) Kill(*r);
     g_built = false; g_menuShown = false; g_touching = -2; g_hover = -2;
     g_barkOpen = false;
     SetLayout(f_barkMode);
 }
 
 static void ScanCatalog();
+static bool g_eggsOnly = false;                         // Spawn Eggs: the Item Spawner list, eggs only
 static void ScanBlocks();
 static void SaveSettings();
 static void Press(Item *it) {
@@ -1314,7 +1340,10 @@ static void Press(Item *it) {
         g_cat = it->target;
         g_page = 0;
         if (it->target == SOUNDBOARD) { try { ScanSongs(); } catch (...) { ym::log("clientdabell: song scan error"); } }
-        if (it->target == SPAWNER) { try { ScanCatalog(); } catch (...) { ym::log("clientdabell: item list error"); } }
+        if (it->target == SPAWNER) {
+            g_eggsOnly = !strcmp(it->label, "Spawn Eggs");   // the same list, only the mob spawn eggs
+            try { ScanCatalog(); } catch (...) { ym::log("clientdabell: item list error"); }
+        }
         if (it->target == BLOCKS) { try { ScanBlocks(); } catch (...) { ym::log("clientdabell: block finder error"); } }
         break;
     case TOGGLE:
@@ -1340,8 +1369,19 @@ static void Press(Item *it) {
 }
 
 // Which part of the menu the pointer touches: row 0..7, -1 = <, kRows = >, -2 = nothing.
+static int TouchingWith(Il2CppObject *pointer);
 static int Touching() {
-    Il2CppObject *board = g_board.get(), *pointer = g_pointer.get();
+    int hit = TouchingWith(g_pointer.get());
+    g_pressSide = 0;
+    if (hit == -2 && f_bothPointers) {                   // Pointer In Both Hands: the other hand's finger too
+        hit = TouchingWith(g_pointer2.get());
+        if (hit != -2) g_pressSide = 1;
+    }
+    return hit;
+}
+static Il2CppObject *PressingPointer() { return g_pressSide ? g_pointer2.get() : g_pointer.get(); }
+static int TouchingWith(Il2CppObject *pointer) {
+    Il2CppObject *board = g_board.get();
     if (!Alive(board) || !Alive(pointer)) return -2;
     Vector3 p = G.trInverseTransformPoint[Tr(board)](G.trGetPosition[Tr(pointer)]());
     if (p.z < -0.035f || p.z > 0.015f) return -2;
@@ -1355,7 +1395,8 @@ static int Touching() {
 
 static void Buzz() {
     if (!G.haptic.IsValid()) return;
-    XRDevice d = G.deviceAtNode(f_rightHand ? 4 : 5);    // the hand that presses
+    bool rightPresses = f_rightHand ? g_pressSide == 1 : g_pressSide == 0;
+    XRDevice d = G.deviceAtNode(rightPresses ? 5 : 4);   // the hand that presses
     if (d.initialized) G.haptic(d.id, 0u, 0.35f, 0.04f);
 }
 
@@ -1365,7 +1406,7 @@ static void CheckPress() {
         int si = g_page * kRows + hit;
         bool onSlider = hit >= 0 && hit < kRows && si < (int)g_view.size() && g_view[si]->fn == NextMenuSize;
         if (onSlider) {
-            Vector3 p = G.trInverseTransformPoint[Tr(g_board.get())](G.trGetPosition[Tr(g_pointer.get())]());
+            Vector3 p = G.trInverseTransformPoint[Tr(g_board.get())](G.trGetPosition[Tr(PressingPointer())]());
             float t = (p.x - (RowX(hit) - kBtnW / 2)) / kBtnW;
             t = t < 0 ? 0 : t > 1 ? 1 : t;
             int pct = 50 + (int)(t * 20 + 0.5f) * 5;       // 50..150 in steps of 5
@@ -1721,7 +1762,7 @@ static void NoclipTick(const Buttons &in) {
 
 // Teleport Gun: hold right grip to aim (a line and a ball show where you land), press
 // the right trigger to go there.
-static Ref g_gunLine, g_gunLineGo, g_gunBall;
+static Ref g_gunLine, g_gunLineGo, g_gunBall, g_stolenItem;
 static bool g_gunTrigger = false;
 static void TeleportGunTick(const Buttons &in) {
     bool aiming = (f_tpGun || f_itemGun || f_stealGun) && in.rgrip;
@@ -1765,7 +1806,7 @@ static void TeleportGunTick(const Buttons &in) {
         if (f_stealGun) {                                 // consenting lobby: grab the item at the ray hit
             if (g_time >= g_nextItem) {
                 g_nextItem = g_time + 0.5;
-                if (!StealItemAt(end, 0)) Notify("No item grabbed"); else Notify("Item moved to hand");
+                if (g_stolenItem.get()) { DropStolenItem(); Notify("Item dropped"); } else if (!StealItemAt(end, 0)) Notify("No item grabbed"); else Notify("Item moved to hand");
             }
         } else if (f_itemGun) {                            // Spawn Item Gun: an item at that spot
             if (g_time >= g_nextItem && LeftHandItem()) {
@@ -2153,6 +2194,17 @@ static void DropItem(Il2CppObject *it) {
     if (G.rbSetUseGravity.IsValid()) G.rbSetUseGravity[rb](true);
     G.rbSetVelocity[rb](Vector3(0, -1.5f, 0));
 }
+static void DropStolenItem() {
+    Il2CppObject *item = g_stolenItem.get();
+    if (!Alive(item)) { g_stolenItem.clear(); return; }
+    try {
+        Il2CppObject *t = G.compTransform[item]();
+        if (t && G.trSetParent.IsValid()) G.trSetParent[t](nullptr, true);
+        DropItem(item);
+    } catch (...) {}
+    g_stolenItem.clear();
+}
+static void StealGunToggled() { if (!f_stealGun) DropStolenItem(); }
 static void DropWatchTick() {
     if (g_dropWatch.empty() || g_time < g_nextDropScan) return;
     g_nextDropScan = g_time + 0.25;
@@ -2716,6 +2768,38 @@ static void ScanBlocks() {
             }
         }
     }
+    // "P:" lines: the parts your own Yeep is made of (and how many), to find which one shows
+    // your body to the other players (for Ghost Yeep).
+    if (Il2CppObject *me = g_player.get()) {
+        Il2CppObject *go = G.compGameObject[me]();
+        Il2CppObject *top = go ? Tr(go) : nullptr;                         // the whole Yeep: start from its top object
+        for (int up = 0; up < 4 && top && G.trGetParent.IsValid(); up++) {
+            Il2CppObject *pt = G.trGetParent[top]();
+            if (!pt) break;
+            top = pt;
+        }
+        Il2CppObject *topGo = top ? G.compGameObject[top]() : go;
+        Class comp("UnityEngine", "Component");
+        if (topGo && comp.IsValid() && G.getComponentsInChildren.IsValid()) {
+            auto *ca = (uint8_t *)G.getComponentsInChildren[topGo]((Il2CppObject *)comp.GetMonoType(), true);
+            size_t n = ca ? *(uintptr_t *)(ca + 0x18) : 0;
+            std::vector<std::pair<std::string, int>> parts;
+            for (size_t i = 0; i < n && i < 3000; i++) {
+                Il2CppObject *cpt = ((Il2CppObject **)(ca + 0x20))[i];
+                if (!Alive(cpt)) continue;
+                const char *cn = r.className(cpt->klass);
+                if (!cn) continue;
+                std::string name = cn;
+                if (name == "Transform" || name == "RectTransform" || name.find("Renderer") != std::string::npos ||
+                    name.find("MeshFilter") != std::string::npos || name.find("Collider") != std::string::npos) continue;
+                bool known = false;
+                for (auto &pc : parts) if (pc.first == name) { pc.second++; known = true; break; }
+                if (!known) parts.push_back({name, 1});
+            }
+            Add("P: your Yeep has " + std::to_string(parts.size()) + " kinds of parts");
+            for (size_t i = 0; i < parts.size() && i < 40; i++) Add("P: " + parts[i].first + " x" + std::to_string(parts[i].second));
+        }
+    }
     Class net("", "NetworkMessenger", Image("Assembly-CSharp.dll"));
     if (net.IsValid()) Collections("N: ", net.GetClass());
     void *itemClass = Class("", "Item", Image("Assembly-CSharp.dll")).GetClass();
@@ -3045,7 +3129,15 @@ static void ScanCatalog() {
     int fromParts = 0;
     try { fromParts = ReadLoadedLists(); } catch (...) { errors++; }
     try { SaveItemCache(); } catch (...) { errors++; }
-    std::vector<std::string> keys = g_seenKeys;
+    std::vector<std::string> keys;
+    for (auto &k : g_seenKeys) {
+        if (g_eggsOnly) {                                 // Spawn Eggs: only names with "egg" in them
+            std::string low = k;
+            for (auto &c : low) c = (char)tolower((unsigned char)c);
+            if (low.find("egg") == std::string::npos) continue;
+        }
+        keys.push_back(k);
+    }
     std::sort(keys.begin(), keys.end());
     g_spawnView.clear();                                 // the buttons point into g_catalog, so rebuild both together
     g_catalog = std::move(keys);
@@ -3057,6 +3149,11 @@ static void ScanCatalog() {
     ym::log("clientdabell: item spawner: %d new from %d game lists, %d new from %d part lists (%s)", fromNet, g_netListsUsed,
             fromParts, g_classListsUsed, g_listFrom.c_str());
     int lists = g_netListsUsed + g_classListsUsed;
+    if (g_eggsOnly) {
+        if (g_catalog.empty()) Notify("No spawn eggs found yet: open Item Spawner once, or hold an egg, then try again");
+        else Notify("%d spawn eggs", (int)g_catalog.size());
+        return;
+    }
     if (g_seenKeys.empty() || (!g_defFound && lists == 0 && g_trustedFrom.empty()))
         Notify("%d items (lists=0; hold or spawn an item, then reopen)", (int)g_catalog.size());
     else if (!g_listFrom.empty()) Notify("%d items (lists=%d, from %s)", (int)g_catalog.size(), lists, g_listFrom.c_str());
@@ -5255,6 +5352,7 @@ static bool StealItemAt(Vector3 point, int side) {
         Il2CppObject *go = G.compGameObject[item]();
         Il2CppObject *rb = go && G.tRigidbody ? G.goGetComponent[go]((Il2CppObject *)G.tRigidbody) : nullptr;
         if (Alive(rb) && G.rbSetKinematic.IsValid()) G.rbSetKinematic[rb](true);
+        g_stolenItem.set(item);
         return true;
     } catch (...) { return false; }
 }
@@ -5262,16 +5360,26 @@ static void LongArmsGrabTick(const Buttons &in) {
     for (int i = 0; i < 2; i++) {
         bool grip = i ? in.rgrip : in.lgrip, press = grip && !g_laGripPrev[i];
         g_laGripPrev[i] = grip;
+        if (press && f_longArms && !g_laValid) {           // say why nothing happens (for fixing)
+            static int notReady = 0;
+            if (notReady++ < 2) Notify("Long Arms isn't stretching right now (menu open or starting up)");
+        }
         if (!grip || !g_laValid) { g_laPull[i].clear(); g_laPullUntil[i] = 0; continue; }
         if (press) {
-            Vector3 gap = g_laReach[i] - g_laReal[i];
-            Il2CppObject *item = Dot(gap, gap) > 0.15f * 0.15f ? NearestItem(g_laReach[i], 0.35f) : nullptr;
+            // The item nearest the long hand (where you see it), in a reach that grows with the arm length.
+            float reach = 0.35f + 0.1f * kArmScales[g_armScale];
+            Il2CppObject *hand = i ? g_rightHand.get() : g_leftHand.get();
+            Vector3 at = hand ? G.trGetPosition[hand]() : g_laReach[i];
+            Il2CppObject *item = NearestItem(at, reach);
+            if (!item) item = NearestItem(g_laReach[i], reach);
+            static int missTold = 0;
+            if (!item && missTold < 3) { missTold++; Notify("Long Arms: no item in reach of that hand"); }
             if (item) {
                 bool grabbed = false;
                 try { grabbed = GameGrab(item, i); } catch (...) {}
                 if (!grabbed) { g_laPull[i].set(item); g_laPullUntil[i] = g_time + 0.5; }   // else: bring it to your hand
-                static int told = 0;                     // say once which way it grabbed (for fixing)
-                if (told++ == 0) Notify(grabbed ? "Long Arms grab: game grab" : "Long Arms grab: pulling it to your hand");
+                static int told = 0;                     // say the first few times which way it grabbed (for fixing)
+                if (told++ < 3) Notify(grabbed ? "Long Arms grab: game grab" : "Long Arms grab: pulling it to your hand");
             }
         }
         Il2CppObject *item = g_laPull[i].get();
@@ -5569,7 +5677,7 @@ static const IntSetting kIntSettings[] = {
 };
 static const BoolSetting kBoolSettings[] = {
     {"rightHandMenu", &f_rightHand}, {"barkMode", &f_barkMode}, {"rainbowMenu", &f_rainbow}, {"colorBlindMode", &f_colorBlind},
-    {"showFps", &f_fps}, {"autoPlay", &f_autoPlay}, {"showClock", &f_clock}, {"notifications", &f_notify}, {"othersHearIt", &f_soundMic},
+    {"showFps", &f_fps}, {"autoPlay", &f_autoPlay}, {"bothPointers", &f_bothPointers}, {"showClock", &f_clock}, {"notifications", &f_notify}, {"othersHearIt", &f_soundMic},
 };
 static std::string g_lastSaved;
 static void SaveSettings() {
@@ -5613,7 +5721,7 @@ static void OnRoomChange() {
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
     try { MicStop(); } catch (...) {}             // the voice object can outlive the room: give it your mic back
     g_recorder.clear();
-    for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo, &g_audioGo}) Kill(*r);
+    for (Ref *r : {&g_menu, &g_pointer, &g_pointer2, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo, &g_audioGo}) Kill(*r);
     g_audioSrc.clear();
     PauseTrackers(false);
     g_dancing = false;
