@@ -1954,6 +1954,14 @@ static void Put(Il2CppObject *arr, size_t i, void *v) { ((void **)((uint8_t *)ar
 // Builds RpcCreateItem's arguments from its own parameter list, in the order the game
 // uses: item id, item key, spawn kind 1, no owner, position, rotation, velocity, spin,
 // properties, 1, 1.
+// Building blocks are all called "mapObject"; which block it is (pillow, door, wall...) is extra
+// text the item carries. When you hold one, that text is copied here and sent along with every
+// spawn of that same name, so copies are the same block instead of an empty one.
+static std::string g_extraKey;                          // the item name the extra text belongs to
+static std::string g_extraShow;                         // a short look at that text, for the popup
+static std::vector<std::string> g_extraArr;             // its text list (sent as the message's text list)
+static std::vector<std::string> g_extraStr;             // its other texts (sent after the ID and the name)
+static void CaptureSpawnData(Il2CppObject *item, const char *key);
 static bool SendItem(const char *key, Vector3 pos, Quaternion rot, Vector3 vel, char *idOut = nullptr) {
     auto *mi = G.rpcCreateItem;
     Il2CppObject *nm = G.netLocal.IsValid() ? G.netLocal() : nullptr;
@@ -1978,10 +1986,12 @@ static bool SendItem(const char *key, Vector3 pos, Quaternion rot, Vector3 vel, 
         Class pc(mi->parameters[i]);
         auto *k = pc.IsValid() ? pc.GetClass() : nullptr;
         void *v = nullptr;
+        bool extra = !g_extraKey.empty() && g_extraKey == key;
         if (tn == "System.String") {
             if (strings == 0) v = CreateMonoString(id);
             else if (strings == 1) v = CreateMonoString(key);
-            strings++;                                   // later strings stay null
+            else if (extra && strings - 2 < (int)g_extraStr.size()) v = CreateMonoString(g_extraStr[strings - 2].c_str());
+            strings++;                                   // later strings stay null (unless the held block had some)
         } else if (tn == "UnityEngine.Vector3") {
             Vector3 vec = vectors == 0 ? pos : vectors == 1 ? vel : Vector3(0, 0, 0);
             vectors++;
@@ -1989,7 +1999,10 @@ static bool SendItem(const char *key, Vector3 pos, Quaternion rot, Vector3 vel, 
         } else if (tn == "UnityEngine.Quaternion") {
             v = G.valueBox(k, &rot);
         } else if (tn == "System.String[]") {
-            v = G.arrayNew(G.stringClass, 0);
+            int n = extra ? (int)g_extraArr.size() : 0;
+            auto *arr = (uint8_t *)G.arrayNew(G.stringClass, n);
+            for (int j = 0; arr && j < n; j++) ((Il2CppObject **)(arr + 0x20))[j] = (Il2CppObject *)CreateMonoString(g_extraArr[j].c_str());
+            v = arr;
         } else if (k && k->byval_arg.valuetype) {
             uint8_t raw[64] = {};
             raw[0] = 1;                                 // spawn kind 1 / the two bytes = 1
@@ -2181,6 +2194,7 @@ static bool LeftHandItem() {
     snprintf(g_itemKey, sizeof g_itemKey, "%s", key->str().c_str());
     SeeKey(g_itemKey);
     g_handItemObj = best;
+    try { CaptureSpawnData(best, g_itemKey); } catch (...) {}
     return true;
 }
 static void ArmDupe9() { if (LeftHandItem()) SpawnGrid(9); }
@@ -2402,6 +2416,56 @@ static Refl &Reflection() {
     r.ok = r.className && r.getFields && r.fieldName && r.fieldType && r.fieldFlags && r.fieldOffset && r.typeKind &&
            r.getParent && r.classType && r.typeObject && r.isSub;
     return r;
+}
+// Copy the extra text a held item carries (its text lists and texts other than its ID and name),
+// so a copy of a building block is the same block. Only text is read, from the item and the parts
+// of its own class chain; numbers and links to other objects are left alone.
+static void CaptureSpawnData(Il2CppObject *item, const char *key) {
+    Refl &r = Reflection();
+    auto typeName = (char *(*)(const void *))ym::api()->resolve("il2cpp_type_get_name");
+    auto freeMem = (void (*)(void *))ym::api()->resolve("il2cpp_free");
+    void *strK = Class("System", "String").GetClass();
+    if (!r.ok || !typeName || !strK || !Alive(item) || !key) return;
+    std::vector<std::string> arr, strs;
+    std::string idText, keyText = key;
+    if (G.itemId.IsValid()) { auto *s = G.itemId[item](); if (s) idText = s->str(); }
+    for (void *c = item->klass; c; c = r.getParent(c)) {
+        const char *cn = r.className(c);
+        if (cn && (!strcmp(cn, "MonoBehaviour") || !strcmp(cn, "Behaviour") || !strcmp(cn, "Component"))) break;
+        void *iter = nullptr;
+        while (void *f = r.getFields(c, &iter)) {
+            if (r.fieldFlags(f) & 0x10) continue;                       // static: not this item's
+            int kind = r.typeKind(r.fieldType(f));
+            int off = (int)r.fieldOffset(f);
+            if (off < (int)sizeof(Il2CppObject) || off > 0x4000) continue;
+            if (kind == 0x0e) {                                          // text
+                auto *o = *(Il2CppObject **)((uint8_t *)item + off);
+                if (!o || o->klass != strK) continue;
+                std::string t = ((BNM::Structures::Mono::String *)o)->str();
+                if (t.empty() || t == idText || t == keyText || t.size() > 200) continue;
+                if (strs.size() < 6) strs.push_back(t);
+            } else if (kind == 0x1d && arr.empty()) {                    // a list of text
+                char *tn = typeName(r.fieldType(f));
+                bool isText = tn && !strcmp(tn, "System.String[]");
+                if (tn && freeMem) freeMem(tn);
+                if (!isText) continue;
+                auto *a = *(uint8_t **)((uint8_t *)item + off);
+                size_t n = a ? *(uintptr_t *)(a + 0x18) : 0;
+                for (size_t k = 0; k < n && k < 32; k++) {
+                    auto *o = ((Il2CppObject **)(a + 0x20))[k];
+                    arr.push_back(o && o->klass == strK ? ((BNM::Structures::Mono::String *)o)->str() : std::string());
+                }
+            }
+        }
+    }
+    g_extraKey = keyText;
+    g_extraArr = arr;
+    g_extraStr = strs;
+    std::string show;
+    for (auto &t : arr) { if (!show.empty()) show += ","; show += t; }
+    for (auto &t : strs) { if (!show.empty()) show += ";"; show += t; }
+    ym::log("clientdabell: held %s carries [%s]", key, show.c_str());
+    g_extraShow = show.size() > 40 ? show.substr(0, 40) : show;
 }
 // Calls fn(offset) for every non-static field of kind `kind` on class k and its parents (up to stop).
 template <typename F> static void EachField(Refl &r, void *k, void *stop, int kind, F fn) {
@@ -2890,6 +2954,7 @@ static bool HeldItemKey(Il2CppObject *hand) {
     if (!key) return false;
     snprintf(g_itemKey, sizeof g_itemKey, "%s", key->str().c_str());
     SeeKey(g_itemKey);
+    try { CaptureSpawnData(best, g_itemKey); } catch (...) {}
     return true;
 }
 static bool IsNotPlainPillow(const std::string &low) {
@@ -2927,7 +2992,8 @@ static void PillowHouseTick() {
     QueueItems(batch);
     g_houseBatch++;
     if (g_houseLeft.empty()) Notify("Pillow house done!");
-    else Notify("Building pillow house %d/%d (%.30s)", g_houseBatch, g_houseBatches, g_houseKey);
+    else Notify("Building pillow house %d/%d (%.20s %.30s)", g_houseBatch, g_houseBatches, g_houseKey,
+                g_extraKey == g_houseKey ? g_extraShow.c_str() : "");
 }
 static void PillowHouse() {
     Il2CppObject *head = g_head.get();
